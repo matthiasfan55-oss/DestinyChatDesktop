@@ -321,6 +321,7 @@ namespace DestinyChatDesktop
         private readonly bool _runSplitSelfTest;
         private readonly string _selfTestResultPath;
         private bool _splitSelfTestStarted;
+        private System.Threading.Tasks.Task _pendingSplitSelfTestTask;
         private bool _dualChatHostEnabled;
         private bool _dualChatHostAvailable;
         private string _dualChatRequestedUrl;
@@ -3832,7 +3833,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 if (_runSplitSelfTest && !_splitSelfTestStarted)
                 {
                     _splitSelfTestStarted = true;
-                    RunSplitSelfTestAsync();
+                    _pendingSplitSelfTestTask = RunSplitSelfTestAsync();
                 }
             }
             else
