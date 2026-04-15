@@ -1,0 +1,14 @@
+artifacts/
+dist/
+sdk/
+UserData/
+_inspect/
+
+*.exe
+*.dll
+*.pdb
+
+review-results.json
+state.json
+cookies.json
+split-self-test.json
