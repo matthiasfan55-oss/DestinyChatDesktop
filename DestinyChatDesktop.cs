@@ -327,6 +327,11 @@ namespace DestinyChatDesktop
         private string _dualChatRequestedUrl;
         private string _dualChatEmptyMessage;
         private int _dualChatInputTop;
+        private int _dualChatPaneLeft;
+        private int _dualChatPaneTop;
+        private int _dualChatPaneWidth;
+        private int _dualChatPaneHeight;
+        private bool _dualChatLayoutActive;
         private int _bigscreenChatTopOffset;
         private bool _isCheckingForUpdates;
         private bool _startupUpdateCheckQueued;
@@ -343,6 +348,11 @@ namespace DestinyChatDesktop
             _pendingNavigation = runSplitSelfTest ? _config.HomeUrl : GetStartupUrl();
             _latestBigscreenEmbeds = new List<BigscreenEmbedState>();
             _dualChatInputTop = 0;
+            _dualChatPaneLeft = 0;
+            _dualChatPaneTop = 0;
+            _dualChatPaneWidth = 0;
+            _dualChatPaneHeight = 0;
+            _dualChatLayoutActive = false;
 
             Text = _config.Title;
             BackColor = Color.FromArgb(18, 18, 18);
@@ -2877,17 +2887,33 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         bindDualChatInputResizeObserver();
 
                         const root = document.documentElement;
+                        const frame = document.getElementById('chat-output-frame');
                         const inputAnchor = document.querySelector('#chat-input-control')
                             || document.querySelector('#chat-input-wrap')
                             || document.querySelector('#chat-input-frame');
                         let inputTop = 0;
                         let bottomOffset = 0;
+                        let paneLeft = 0;
+                        let paneTop = 0;
+                        let paneWidth = 0;
+                        let paneHeight = 0;
+                        const layoutActive = !!dualChatEnabled && document.body.classList.contains('codex-dual-chat-enabled');
 
                         if (inputAnchor instanceof Element) {
                             const rect = inputAnchor.getBoundingClientRect();
                             if (rect.height > 0 && rect.top < window.innerHeight) {
                                 inputTop = Math.max(0, Math.round(rect.top));
                                 bottomOffset = Math.max(0, Math.round(window.innerHeight - rect.top));
+                            }
+                        }
+
+                        if (layoutActive && frame instanceof Element) {
+                            const frameRect = frame.getBoundingClientRect();
+                            if (frameRect.width > 0 && inputTop > frameRect.top) {
+                                paneWidth = Math.max(0, Math.round((frameRect.width - 14) / 2));
+                                paneTop = Math.max(0, Math.round(frameRect.top));
+                                paneLeft = Math.max(0, Math.round(frameRect.right - paneWidth));
+                                paneHeight = Math.max(0, Math.round(inputTop - frameRect.top));
                             }
                         }
 
@@ -2900,7 +2926,12 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             host.postMessage({
                                 type: 'codex-dual-chat-layout',
                                 inputTop: inputTop,
-                                bottomOffset: bottomOffset
+                                bottomOffset: bottomOffset,
+                                layoutActive: layoutActive,
+                                paneLeft: paneLeft,
+                                paneTop: paneTop,
+                                paneWidth: paneWidth,
+                                paneHeight: paneHeight
                             });
                         }
                     }
@@ -4384,6 +4415,11 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 if (string.Equals(type, "codex-dual-chat-layout", StringComparison.OrdinalIgnoreCase))
                 {
                     int inputTop = 0;
+                    int paneLeft = 0;
+                    int paneTop = 0;
+                    int paneWidth = 0;
+                    int paneHeight = 0;
+                    bool layoutActive = false;
                     if (message.ContainsKey("inputTop"))
                     {
                         object inputTopValue = message["inputTop"];
@@ -4397,7 +4433,77 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         }
                     }
 
+                    if (message.ContainsKey("paneLeft"))
+                    {
+                        object paneLeftValue = message["paneLeft"];
+                        if (paneLeftValue is int)
+                        {
+                            paneLeft = (int)paneLeftValue;
+                        }
+                        else
+                        {
+                            int.TryParse(Convert.ToString(paneLeftValue), out paneLeft);
+                        }
+                    }
+
+                    if (message.ContainsKey("paneTop"))
+                    {
+                        object paneTopValue = message["paneTop"];
+                        if (paneTopValue is int)
+                        {
+                            paneTop = (int)paneTopValue;
+                        }
+                        else
+                        {
+                            int.TryParse(Convert.ToString(paneTopValue), out paneTop);
+                        }
+                    }
+
+                    if (message.ContainsKey("paneWidth"))
+                    {
+                        object paneWidthValue = message["paneWidth"];
+                        if (paneWidthValue is int)
+                        {
+                            paneWidth = (int)paneWidthValue;
+                        }
+                        else
+                        {
+                            int.TryParse(Convert.ToString(paneWidthValue), out paneWidth);
+                        }
+                    }
+
+                    if (message.ContainsKey("paneHeight"))
+                    {
+                        object paneHeightValue = message["paneHeight"];
+                        if (paneHeightValue is int)
+                        {
+                            paneHeight = (int)paneHeightValue;
+                        }
+                        else
+                        {
+                            int.TryParse(Convert.ToString(paneHeightValue), out paneHeight);
+                        }
+                    }
+
+                    if (message.ContainsKey("layoutActive"))
+                    {
+                        object layoutActiveValue = message["layoutActive"];
+                        if (layoutActiveValue is bool)
+                        {
+                            layoutActive = (bool)layoutActiveValue;
+                        }
+                        else
+                        {
+                            bool.TryParse(Convert.ToString(layoutActiveValue), out layoutActive);
+                        }
+                    }
+
                     _dualChatInputTop = Math.Max(0, inputTop);
+                    _dualChatPaneLeft = Math.Max(0, paneLeft);
+                    _dualChatPaneTop = Math.Max(0, paneTop);
+                    _dualChatPaneWidth = Math.Max(0, paneWidth);
+                    _dualChatPaneHeight = Math.Max(0, paneHeight);
+                    _dualChatLayoutActive = layoutActive;
                     LayoutDualChatPanel();
                     return;
                 }
@@ -4597,18 +4703,21 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             int bottom = webViewBounds.Bottom;
             int width = Math.Max(320, (webViewBounds.Width - 14) / 2);
             int height = Math.Max(0, bottom - top);
+            int left = webViewBounds.Right - width;
 
             if (IsChatPage())
             {
-                if (_dualChatInputTop <= 0)
+                if (!_dualChatLayoutActive || _dualChatPaneWidth <= 0 || _dualChatPaneHeight <= 0)
                 {
                     _dualChatPanel.Visible = false;
                     return;
                 }
 
                 double zoomFactor = _browserReady ? ClampZoom(_webView.ZoomFactor) : ClampZoom(_state.ZoomFactor);
-                int scaledInputTop = (int)Math.Round(_dualChatInputTop * zoomFactor);
-                height = Math.Min(height, Math.Max(0, scaledInputTop));
+                left = webViewBounds.Left + (int)Math.Round(_dualChatPaneLeft * zoomFactor);
+                top = webViewBounds.Top + (int)Math.Round(_dualChatPaneTop * zoomFactor);
+                width = Math.Max(0, (int)Math.Round(_dualChatPaneWidth * zoomFactor));
+                height = Math.Max(0, (int)Math.Round(_dualChatPaneHeight * zoomFactor));
             }
             else if (IsBigscreenPage())
             {
@@ -4616,9 +4725,9 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 int cappedHeight = (int)Math.Round(fullHeight * 0.60);
                 top = bottom - cappedHeight;
                 height = Math.Max(0, bottom - top);
+                left = webViewBounds.Right - width;
             }
 
-            int left = webViewBounds.Right - width;
             _dualChatPanel.Bounds = new Rectangle(left, top, width, height);
             _dualChatPanel.Visible = height > 0;
             _dualChatPanel.BringToFront();
@@ -4658,6 +4767,11 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 if (!IsChatPage())
                 {
                     _dualChatInputTop = 0;
+                    _dualChatPaneLeft = 0;
+                    _dualChatPaneTop = 0;
+                    _dualChatPaneWidth = 0;
+                    _dualChatPaneHeight = 0;
+                    _dualChatLayoutActive = false;
                 }
                 _dualChatPanel.Visible = false;
                 _dualChatView.Visible = false;
