@@ -4596,17 +4596,27 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             int top = webViewBounds.Top;
             int bottom = webViewBounds.Bottom;
             int width = Math.Max(320, (webViewBounds.Width - 14) / 2);
+            int height = Math.Max(0, bottom - top);
 
-            // On bigscreen, cap the panel to the bottom 60% of the webview height
-            // so it sits below the video embed area and doesn't cover the video player.
-            if (IsBigscreenPage())
+            if (IsChatPage())
+            {
+                if (_dualChatInputTop <= 0)
+                {
+                    _dualChatPanel.Visible = false;
+                    return;
+                }
+
+                double zoomFactor = _browserReady ? ClampZoom(_webView.ZoomFactor) : ClampZoom(_state.ZoomFactor);
+                int scaledInputTop = (int)Math.Round(_dualChatInputTop * zoomFactor);
+                height = Math.Min(height, Math.Max(0, scaledInputTop));
+            }
+            else if (IsBigscreenPage())
             {
                 int fullHeight = bottom - top;
                 int cappedHeight = (int)Math.Round(fullHeight * 0.60);
                 top = bottom - cappedHeight;
+                height = Math.Max(0, bottom - top);
             }
-
-            int height = Math.Max(0, bottom - top);
 
             int left = webViewBounds.Right - width;
             _dualChatPanel.Bounds = new Rectangle(left, top, width, height);
