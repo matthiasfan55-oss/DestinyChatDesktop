@@ -65,7 +65,7 @@ namespace DestinyChatDesktop
         public AppConfig()
         {
             Title = "Destiny.gg Chat Desktop";
-            AppVersion = "0.1.0";
+            AppVersion = "0.1.1";
             HomeUrl = "https://www.destiny.gg/embed/chat";
             SiteUrl = "https://www.destiny.gg/";
             AllowedHostSuffixes = new[] { "destiny.gg" };
