@@ -402,6 +402,9 @@ namespace DestinyChatDesktop
             _toolStrip.Items.Add(_loginButton);
             _toolStrip.Items.Add(_reloadButton);
             _toolStrip.Items.Add(_updateButton);
+            _toolStrip.Items.Add(_addressBox);
+            _toolStrip.Items.Add(_goButton);
+            _toolStrip.Items.Add(_browserButton);
             _toolStrip.Items.Add(new ToolStripSeparator());
             _toolStrip.Items.Add(_muteButton);
             _toolStrip.Items.Add(_pinButton);
