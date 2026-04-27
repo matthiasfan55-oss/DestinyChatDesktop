@@ -6614,12 +6614,26 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         const cr = wrap ? wrap.getBoundingClientRect() : null;
                         const chatTop = cr ? Math.round(cr.top) : -1;
                         const bad = (mb > 64 && chatTop >= 0 && chatTop < mb - 8) || (mb > 64 && chatTop < 0);
+                        const kickFrame = Array.from(document.querySelectorAll('iframe')).find((frame) => {
+                            const src = String((frame.getAttribute('src') || frame.src || '')).toLowerCase();
+                            return src.indexOf('player.kick.com') >= 0;
+                        }) || null;
+                        const kickSrc = kickFrame ? String(kickFrame.getAttribute('src') || kickFrame.src || '') : '';
+                        const kickAllow = kickFrame ? String(kickFrame.getAttribute('allow') || '') : '';
+                        const kickNormalized = kickSrc.toLowerCase().indexOf('player.kick.com') >= 0 &&
+                            kickSrc.toLowerCase().indexOf('autoplay=true') >= 0 &&
+                            kickSrc.toLowerCase().indexOf('muted=true') >= 0 &&
+                            kickAllow.toLowerCase().indexOf('autoplay') >= 0 &&
+                            !!(kickFrame && kickFrame.getAttribute('allowfullscreen'));
                         return JSON.stringify({
-                            ok: !bad,
+                            ok: !bad && kickNormalized,
                             mediaBottom: mb,
                             chatTop: chatTop,
                             innerHeight: Math.round(window.innerHeight || 0),
-                            overlap: bad
+                            overlap: bad,
+                            kickSrc: kickSrc,
+                            kickAllow: kickAllow,
+                            kickNormalized: kickNormalized
                         });
                     })();
                 ";
@@ -11303,7 +11317,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 return null;
             }
 
-            return "https://player.kick.com/" + Uri.EscapeDataString(channel) + "?autoplay=true";
+            return "https://player.kick.com/" + Uri.EscapeDataString(channel) + "?autoplay=true&muted=true";
         }
 
         private static string BuildRumblePlayerUrl(string mediaId)
@@ -12096,6 +12110,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     const host = window.chrome && window.chrome.webview;
                     if (!host || typeof host.postMessage !== 'function') return;
                     let lastEmbeddedStreamChatEnabled = null;
+                    let observedEnabledStreamChatOnce = false;
 
                     const CHAT_TOP_SELECTORS = [
                         '#chat-output-frame',
@@ -12386,6 +12401,51 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         }
                     }
 
+                    function normalizeKickPlayerFrames() {
+                        const frames = Array.from(document.querySelectorAll('iframe'));
+                        for (let i = 0; i < frames.length; i++) {
+                            const frame = frames[i];
+                            const rawSrc = String(frame && (frame.getAttribute('src') || frame.src || '') || '');
+                            const lowerSrc = rawSrc.toLowerCase();
+                            if (lowerSrc.indexOf('player.kick.com') < 0) {
+                                continue;
+                            }
+
+                            try {
+                                const allowValue = 'autoplay; fullscreen; encrypted-media; picture-in-picture';
+                                if (frame.getAttribute('allow') !== allowValue) {
+                                    frame.setAttribute('allow', allowValue);
+                                }
+                                if (frame.getAttribute('allowfullscreen') !== 'true') {
+                                    frame.setAttribute('allowfullscreen', 'true');
+                                }
+                                if (frame.getAttribute('scrolling') !== 'no') {
+                                    frame.setAttribute('scrolling', 'no');
+                                }
+                            } catch (error) {
+                            }
+
+                            try {
+                                const parsed = new URL(rawSrc, location.href);
+                                let changed = false;
+                                if ((parsed.searchParams.get('autoplay') || '').toLowerCase() !== 'true') {
+                                    parsed.searchParams.set('autoplay', 'true');
+                                    changed = true;
+                                }
+                                if ((parsed.searchParams.get('muted') || '').toLowerCase() !== 'true') {
+                                    parsed.searchParams.set('muted', 'true');
+                                    changed = true;
+                                }
+
+                                const nextSrc = parsed.toString();
+                                if (changed && nextSrc !== rawSrc) {
+                                    frame.setAttribute('src', nextSrc);
+                                }
+                            } catch (error) {
+                            }
+                        }
+                    }
+
                     function syncBigscreenDualFromEmbeddedChat() {
                         const allFrames = Array.from(document.querySelectorAll('iframe'));
                         let chatFrame = null;
@@ -12426,14 +12486,25 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             }
                         }
 
-                        if (streamButtonFound && lastEmbeddedStreamChatEnabled !== streamChatEnabled) {
+                        if (!streamButtonFound && lastEmbeddedStreamChatEnabled !== null) {
+                            streamChatEnabled = !!lastEmbeddedStreamChatEnabled;
+                        }
+
+                        if (streamButtonFound) {
+                            const shouldRelay = lastEmbeddedStreamChatEnabled !== streamChatEnabled &&
+                                (streamChatEnabled || observedEnabledStreamChatOnce);
                             lastEmbeddedStreamChatEnabled = streamChatEnabled;
-                            try {
-                                host.postMessage({
-                                    type: 'codex-bigscreen-dual-toggle',
-                                    enabled: streamChatEnabled
-                                });
-                            } catch (error) {
+                            if (streamChatEnabled) {
+                                observedEnabledStreamChatOnce = true;
+                            }
+                            if (shouldRelay) {
+                                try {
+                                    host.postMessage({
+                                        type: 'codex-bigscreen-dual-toggle',
+                                        enabled: streamChatEnabled
+                                    });
+                                } catch (error) {
+                                }
                             }
                         }
 
@@ -12570,10 +12641,16 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         if (w1) wraps.push(w1);
                         if (w2 && w2 !== w1) wraps.push(w2);
                         let maxPush = 0;
+                        const currentPush = Math.max(
+                            0,
+                            parseFloat(root.style.getPropertyValue('--codex-chat-below-media-push')) || 0
+                        );
+                        const clearance = 12;
                         for (let i = 0; i < wraps.length; i++) {
                             const wrap = wraps[i];
                             const rect = wrap.getBoundingClientRect();
-                            const push = Math.max(0, Math.round(mediaBottom - rect.top));
+                            const naturalTop = Math.round(rect.top - currentPush);
+                            const push = Math.max(0, Math.round(mediaBottom + clearance - naturalTop));
                             maxPush = Math.max(maxPush, push);
                         }
                         const nextPush = maxPush + 'px';
@@ -12592,6 +12669,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         window.requestAnimationFrame(() => {
                             scheduled = false;
                             hideBigscreenActionButtons();
+                            normalizeKickPlayerFrames();
                             ensureBigscreenChatClampStyle();
                             document.body.classList.add('codex-bigscreen-chat-below-media');
                             enforceBigscreenChatBelowMedia();
@@ -12609,6 +12687,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         setTimeout(scheduleReport, 800);
                     });
                     document.addEventListener('DOMContentLoaded', scheduleReport, { once: true });
+                    window.setInterval(normalizeKickPlayerFrames, 2000);
                     window.setInterval(reportMediaState, 2000);
                     window.setInterval(hideBigscreenActionButtons, 1000);
                     window.setInterval(syncBigscreenDualFromEmbeddedChat, 500);
