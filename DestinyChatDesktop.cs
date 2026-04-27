@@ -4293,49 +4293,11 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         const btn = document.getElementById('codex-ext-panel-btn');
                         if (btn) btn.classList.toggle('codex-split-chat-active', !!open);
                     }
-                    function buildExtPanelBtn() {
-                        if (document.getElementById('codex-ext-panel-btn')) return;
-                        const ref = document.getElementById('chat-watching-focus-btn')
-                            || document.getElementById('chat-settings-btn');
-                        if (!ref || !ref.parentElement) return;
-                        const btn = document.createElement('a');
-                        btn.id = 'codex-ext-panel-btn';
-                        btn.className = 'chat-tool-btn';
-                        btn.setAttribute('role', 'button');
-                        btn.title = 'External Chat Panel';
-                        btn.setAttribute('data-tippy-content', 'External Chat Panel');
-                        btn.innerHTML = `<i class=""btn-icon"" style=""opacity:1;background-repeat:no-repeat;background-position:center;background-size:90% 90%;background-image:url(&quot;data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect x='2' y='3' width='9' height='18' rx='1.5' fill='none' stroke='white' stroke-width='1.75'/><rect x='13' y='3' width='9' height='18' rx='1.5' fill='none' stroke='white' stroke-width='1.75'/><line x1='7.5' y1='7' x2='7.5' y2='17' stroke='white' stroke-width='1.25' stroke-linecap='round'/><line x1='17.5' y1='7' x2='17.5' y2='17' stroke='white' stroke-width='1.25' stroke-linecap='round'/></svg>&quot;)""></i>`;
-                        btn.addEventListener('click', e => {
-                            e.preventDefault(); e.stopPropagation();
-                            const p = document.getElementById(EXT_PANEL);
-                            if (p && p.style.display !== 'none') closeExtPanel();
-                            else {
-                                const opened = openExtPanel();
-                                if (!opened) {
-                                    buildSettings();
-                                    const settingsPanel = document.getElementById(SETT_ID);
-                                    if (settingsPanel) {
-                                        settingsPanel.classList.add('active');
-                                    }
-                                    const settingsBtn = document.getElementById('codex-ext-settings-btn');
-                                    if (settingsBtn) {
-                                        settingsBtn.classList.add('codex-split-chat-active');
-                                    }
-                                    const urlInput = settingsPanel
-                                        ? settingsPanel.querySelector('input[placeholder*=""#kick/username""]')
-                                        : null;
-                                    if (urlInput && typeof urlInput.focus === 'function') {
-                                        urlInput.focus();
-                                        if (typeof urlInput.select === 'function') {
-                                            urlInput.select();
-                                        }
-                                    }
-                                    btn.style.outline = '2px solid orange';
-                                    btn.title = 'Set external chat URL first';
-                                }
-                            }
-                        });
-                        ref.parentElement.insertBefore(btn, ref);
+                    function removeExtPanelBtn() {
+                        const btn = document.getElementById('codex-ext-panel-btn');
+                        if (btn && btn.parentElement) {
+                            btn.parentElement.removeChild(btn);
+                        }
                     }
 
                     // ── Feature 5: Double-click username → append to chat input ───
@@ -4884,7 +4846,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         ensureSettingsStyles();
                         ensureDualChatMessageBridge();
                         buildSettingsBtn();
-                        buildExtPanelBtn();
+                        removeExtPanelBtn();
                         buildDinkDonkBtn();
                         buildSnipBtn();
                         buildDualChatBtn();
@@ -5290,7 +5252,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         let dinkDonkButtonToggleWorked = false;
                         let dinkDonkAutoOpenFunctionWorked = false;
                         let externalChatUrlPersistWorked = false;
-                        let externalChatPanelFunctionWorked = false;
+                        let externalChatPanelButtonAbsent = false;
                         let chatInputDoubleClickToggleWorked = false;
                         let chatInputDoubleClickFunctionWorked = false;
                         let phraseHighlightsToggleWorked = false;
@@ -5730,23 +5692,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                                 }
                             }
 
-                            {
-                                const extButton = document.getElementById('codex-ext-panel-btn');
-                                const extUrlBefore = readStored('externalChat.url');
-                                if (extButton) {
-                                    writeStored('externalChat.url', '#kick/pizzaw');
-                                    extButton.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: true, button: 0, buttons: 1 }));
-                                    await wait(180);
-                                    const panel = document.getElementById('codex-ext-panel');
-                                    const iframe = panel ? panel.querySelector('iframe') : null;
-                                    const openWorked = !!(panel && panel.style.display !== 'none' && iframe && String(iframe.src || '').indexOf('kick.com/popout/pizzaw/chat') >= 0);
-                                    extButton.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: true, button: 0, buttons: 1 }));
-                                    await wait(120);
-                                    const closedWorked = !!(panel && panel.style.display === 'none');
-                                    externalChatPanelFunctionWorked = openWorked && closedWorked;
-                                    writeStored('externalChat.url', extUrlBefore);
-                                }
-                            }
+                            externalChatPanelButtonAbsent = !document.getElementById('codex-ext-panel-btn');
 
                             {
                                 const ta = document.querySelector('#chat-input-control');
@@ -5993,8 +5939,8 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         if (!externalChatUrlPersistWorked) {
                             failedChecks.push('external-chat-url-persist');
                         }
-                        if (!externalChatPanelFunctionWorked) {
-                            failedChecks.push('external-chat-panel-function');
+                        if (!externalChatPanelButtonAbsent) {
+                            failedChecks.push('external-chat-panel-button-absent');
                         }
                         if (!chatInputDoubleClickToggleWorked) {
                             failedChecks.push('chat-input-doubleclick-toggle');
@@ -6078,7 +6024,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             dinkDonkButtonToggleWorked: dinkDonkButtonToggleWorked,
                             dinkDonkAutoOpenFunctionWorked: dinkDonkAutoOpenFunctionWorked,
                             externalChatUrlPersistWorked: externalChatUrlPersistWorked,
-                            externalChatPanelFunctionWorked: externalChatPanelFunctionWorked,
+                            externalChatPanelButtonAbsent: externalChatPanelButtonAbsent,
                             chatInputDoubleClickToggleWorked: chatInputDoubleClickToggleWorked,
                             chatInputDoubleClickFunctionWorked: chatInputDoubleClickFunctionWorked,
                             phraseHighlightsToggleWorked: phraseHighlightsToggleWorked,
@@ -6290,6 +6236,11 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     }
                 }
 
+                if (WindowState == FormWindowState.Normal)
+                {
+                    Size = new Size(Math.Max(1280, Width), Math.Max(760, Height));
+                }
+
                 NavigateToUrl("https://www.destiny.gg/bigscreen#kick/Destiny");
                 await System.Threading.Tasks.Task.Delay(3200);
                 ReloadCurrentPage();
@@ -6320,17 +6271,48 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             }
                             return bottom;
                         }
+                        function playerMediaRight() {
+                            let right = 0;
+                            const frames = Array.from(document.querySelectorAll('iframe'));
+                            for (let i = 0; i < frames.length; i++) {
+                                const f = frames[i];
+                                const s = String((f.getAttribute('src') || f.src || '')).toLowerCase();
+                                if (s.indexOf('player.kick.com') >= 0 || s.indexOf('kick.com/embed') >= 0 || s.indexOf('youtube.com/embed') >= 0) {
+                                    const r = f.getBoundingClientRect();
+                                    if (r.height > 32 && r.width > 32) right = Math.max(right, Math.round(r.right));
+                                }
+                            }
+                            const v = document.querySelector('video') || document.querySelector('.video-js video');
+                            if (v) {
+                                const r = v.getBoundingClientRect();
+                                if (r.height > 32) right = Math.max(right, Math.round(r.right));
+                            }
+                            return right;
+                        }
                         const mb = playerMediaBottom();
+                        const mr = playerMediaRight();
                         const wrap = document.querySelector('#chat-wrap') || document.querySelector('.chat-wrap');
                         const cr = wrap ? wrap.getBoundingClientRect() : null;
                         const chatTop = cr ? Math.round(cr.top) : -1;
-                        const bad = (mb > 64 && chatTop >= 0 && chatTop < mb - 8) || (mb > 64 && chatTop < 0);
+                        const chatLeft = cr ? Math.round(cr.left) : -1;
+                        const sideLayout = !!(cr && mr > 64 && chatLeft >= mr - 16);
+                        const forcedPush = parseFloat(document.documentElement.style.getPropertyValue('--codex-chat-below-media-push')) || 0;
+                        const bad = !sideLayout && ((mb > 64 && chatTop >= 0 && chatTop < mb - 8) || (mb > 64 && chatTop < 0));
+                        const sideLayoutOk = !sideLayout || (
+                            forcedPush <= 0 &&
+                            !(document.body && document.body.classList.contains('codex-bigscreen-chat-below-media'))
+                        );
                         return JSON.stringify({
-                            ok: !bad,
+                            ok: !bad && sideLayoutOk,
                             mediaBottom: mb,
+                            mediaRight: mr,
                             chatTop: chatTop,
+                            chatLeft: chatLeft,
                             innerHeight: Math.round(window.innerHeight || 0),
-                            overlap: bad
+                            overlap: bad,
+                            sideLayout: sideLayout,
+                            sideLayoutOk: sideLayoutOk,
+                            forcedPush: forcedPush
                         });
                     })();
                 ");
@@ -6609,11 +6591,37 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             }
                             return bottom;
                         }
+                        function playerMediaRight() {
+                            let right = 0;
+                            const frames = Array.from(document.querySelectorAll('iframe'));
+                            for (let i = 0; i < frames.length; i++) {
+                                const f = frames[i];
+                                const s = String((f.getAttribute('src') || f.src || '')).toLowerCase();
+                                if (s.indexOf('player.kick.com') >= 0 || s.indexOf('kick.com/embed') >= 0 || s.indexOf('youtube.com/embed') >= 0) {
+                                    const r = f.getBoundingClientRect();
+                                    if (r.height > 32 && r.width > 32) right = Math.max(right, Math.round(r.right));
+                                }
+                            }
+                            const v = document.querySelector('video') || document.querySelector('.video-js video');
+                            if (v) {
+                                const r = v.getBoundingClientRect();
+                                if (r.height > 32) right = Math.max(right, Math.round(r.right));
+                            }
+                            return right;
+                        }
                         const mb = playerMediaBottom();
+                        const mr = playerMediaRight();
                         const wrap = document.querySelector('#chat-wrap') || document.querySelector('.chat-wrap');
                         const cr = wrap ? wrap.getBoundingClientRect() : null;
                         const chatTop = cr ? Math.round(cr.top) : -1;
-                        const bad = (mb > 64 && chatTop >= 0 && chatTop < mb - 8) || (mb > 64 && chatTop < 0);
+                        const chatLeft = cr ? Math.round(cr.left) : -1;
+                        const sideLayout = !!(cr && mr > 64 && chatLeft >= mr - 16);
+                        const forcedPush = parseFloat(document.documentElement.style.getPropertyValue('--codex-chat-below-media-push')) || 0;
+                        const bad = !sideLayout && ((mb > 64 && chatTop >= 0 && chatTop < mb - 8) || (mb > 64 && chatTop < 0));
+                        const sideLayoutOk = !sideLayout || (
+                            forcedPush <= 0 &&
+                            !(document.body && document.body.classList.contains('codex-bigscreen-chat-below-media'))
+                        );
                         const kickFrame = Array.from(document.querySelectorAll('iframe')).find((frame) => {
                             const src = String((frame.getAttribute('src') || frame.src || '')).toLowerCase();
                             return src.indexOf('player.kick.com') >= 0;
@@ -6626,11 +6634,16 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             kickAllow.toLowerCase().indexOf('autoplay') >= 0 &&
                             !!(kickFrame && kickFrame.getAttribute('allowfullscreen'));
                         return JSON.stringify({
-                            ok: !bad && kickNormalized,
+                            ok: !bad && kickNormalized && sideLayoutOk,
                             mediaBottom: mb,
+                            mediaRight: mr,
                             chatTop: chatTop,
+                            chatLeft: chatLeft,
                             innerHeight: Math.round(window.innerHeight || 0),
                             overlap: bad,
+                            sideLayout: sideLayout,
+                            sideLayoutOk: sideLayoutOk,
+                            forcedPush: forcedPush,
                             kickSrc: kickSrc,
                             kickAllow: kickAllow,
                             kickNormalized: kickNormalized
@@ -12258,6 +12271,57 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         return Math.max(0, bottom);
                     }
 
+                    function getMediaBounds() {
+                        const candidates = [];
+                        const iframeCandidates = Array.from(document.querySelectorAll('iframe'));
+                        for (let i = 0; i < iframeCandidates.length; i++) {
+                            const frame = iframeCandidates[i];
+                            const src = String(frame && (frame.getAttribute('src') || frame.src || '')).toLowerCase();
+                            if (!src) {
+                                continue;
+                            }
+                            if (src.indexOf('player.kick.com') >= 0 ||
+                                src.indexOf('kick.com/embed') >= 0 ||
+                                src.indexOf('youtube.com/embed') >= 0 ||
+                                src.indexOf('twitch.tv') >= 0) {
+                                candidates.push(frame);
+                            }
+                        }
+
+                        const video = document.querySelector('video') || document.querySelector('.video-js video');
+                        if (video) {
+                            candidates.push(video);
+                        }
+
+                        let bounds = null;
+                        for (let i = 0; i < candidates.length; i++) {
+                            const el = candidates[i];
+                            if (!el || typeof el.getBoundingClientRect !== 'function') {
+                                continue;
+                            }
+                            const rect = el.getBoundingClientRect();
+                            if (rect.width < 40 || rect.height < 40) {
+                                continue;
+                            }
+
+                            if (!bounds) {
+                                bounds = {
+                                    top: Math.round(rect.top),
+                                    left: Math.round(rect.left),
+                                    right: Math.round(rect.right),
+                                    bottom: Math.round(rect.bottom)
+                                };
+                            } else {
+                                bounds.top = Math.min(bounds.top, Math.round(rect.top));
+                                bounds.left = Math.min(bounds.left, Math.round(rect.left));
+                                bounds.right = Math.max(bounds.right, Math.round(rect.right));
+                                bounds.bottom = Math.max(bounds.bottom, Math.round(rect.bottom));
+                            }
+                        }
+
+                        return bounds;
+                    }
+
                     function reportLayout() {
                         const selectorTop = getTopFromSelectors(CHAT_TOP_SELECTORS);
                         const embeddedChatTop = getEmbeddedChatFrameTop();
@@ -12627,12 +12691,13 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     }
 
                     function enforceBigscreenChatBelowMedia() {
-                        const mediaBottom = getMediaBottom();
                         const root = document.documentElement;
-                        if (mediaBottom <= 48) {
+                        const mediaBounds = getMediaBounds();
+                        if (!mediaBounds || mediaBounds.bottom <= 48) {
                             if (root.style.getPropertyValue('--codex-chat-below-media-push')) {
                                 root.style.removeProperty('--codex-chat-below-media-push');
                             }
+                            document.body.classList.remove('codex-bigscreen-chat-below-media');
                             return;
                         }
                         const wraps = [];
@@ -12640,6 +12705,18 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         const w2 = document.querySelector('.chat-wrap');
                         if (w1) wraps.push(w1);
                         if (w2 && w2 !== w1) wraps.push(w2);
+                        for (let i = 0; i < wraps.length; i++) {
+                            const rect = wraps[i].getBoundingClientRect();
+                            if (rect.width > 40 && rect.height > 40 && rect.left >= mediaBounds.right - 16) {
+                                if (root.style.getPropertyValue('--codex-chat-below-media-push')) {
+                                    root.style.removeProperty('--codex-chat-below-media-push');
+                                }
+                                document.body.classList.remove('codex-bigscreen-chat-below-media');
+                                return;
+                            }
+                        }
+
+                        document.body.classList.add('codex-bigscreen-chat-below-media');
                         let maxPush = 0;
                         const currentPush = Math.max(
                             0,
@@ -12650,7 +12727,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             const wrap = wraps[i];
                             const rect = wrap.getBoundingClientRect();
                             const naturalTop = Math.round(rect.top - currentPush);
-                            const push = Math.max(0, Math.round(mediaBottom + clearance - naturalTop));
+                            const push = Math.max(0, Math.round(mediaBounds.bottom + clearance - naturalTop));
                             maxPush = Math.max(maxPush, push);
                         }
                         const nextPush = maxPush + 'px';
@@ -12671,7 +12748,6 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             hideBigscreenActionButtons();
                             normalizeKickPlayerFrames();
                             ensureBigscreenChatClampStyle();
-                            document.body.classList.add('codex-bigscreen-chat-below-media');
                             enforceBigscreenChatBelowMedia();
                             syncBigscreenDualFromEmbeddedChat();
                             reportLayout();
@@ -12693,7 +12769,6 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     window.setInterval(syncBigscreenDualFromEmbeddedChat, 500);
                     window.setInterval(() => {
                         ensureBigscreenChatClampStyle();
-                        document.body.classList.add('codex-bigscreen-chat-below-media');
                         enforceBigscreenChatBelowMedia();
                     }, 400);
 
