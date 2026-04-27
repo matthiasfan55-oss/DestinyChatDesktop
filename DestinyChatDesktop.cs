@@ -5,6 +5,7 @@ using System.Drawing;
 using System.IO;
 using System.Net;
 using System.Runtime.InteropServices;
+using System.Globalization;
 using System.Text;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
@@ -13,6 +14,78 @@ using Microsoft.Web.WebView2.WinForms;
 
 namespace DestinyChatDesktop
 {
+    internal static class AgentDebugLog
+    {
+        private static readonly object Sync = new object();
+        private static readonly JavaScriptSerializer Serializer = new JavaScriptSerializer();
+        private static readonly bool Enabled = IsEnabled();
+        private static readonly string LogPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "DestinyChatDesktop",
+            "debug-a0e27b.log");
+
+        public static void Write(string runId, string hypothesisId, string location, string message, Dictionary<string, object> data)
+        {
+            if (!Enabled)
+            {
+                return;
+            }
+
+            try
+            {
+                Dictionary<string, object> payload = new Dictionary<string, object>
+                {
+                    { "sessionId", "a0e27b" },
+                    { "runId", runId ?? string.Empty },
+                    { "hypothesisId", hypothesisId ?? string.Empty },
+                    { "location", location ?? string.Empty },
+                    { "message", message ?? string.Empty },
+                    { "data", data ?? new Dictionary<string, object>() },
+                    { "timestamp", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() },
+                    { "id", Guid.NewGuid().ToString("N") }
+                };
+
+                string line = Serializer.Serialize(payload);
+                lock (Sync)
+                {
+                    string dir = Path.GetDirectoryName(LogPath);
+                    if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                    {
+                        Directory.CreateDirectory(dir);
+                    }
+                    File.AppendAllText(LogPath, line + Environment.NewLine);
+                }
+            }
+            catch (Exception ex)
+            {
+                try { Debug.WriteLine("AgentDebugLog.Write failed: " + ex); } catch { }
+            }
+        }
+
+        private static bool IsEnabled()
+        {
+            string env = Environment.GetEnvironmentVariable("DESTINY_CHAT_DEBUG_LOG");
+            if (!string.IsNullOrWhiteSpace(env) &&
+                (env.Equals("1", StringComparison.OrdinalIgnoreCase) ||
+                 env.Equals("true", StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+
+            string[] args = Environment.GetCommandLineArgs();
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (!string.IsNullOrWhiteSpace(args[i]) &&
+                    args[i].StartsWith("--self-test", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
     internal static class Program
     {
         [STAThread]
@@ -20,6 +93,36 @@ namespace DestinyChatDesktop
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+            Application.ThreadException += delegate(object sender, System.Threading.ThreadExceptionEventArgs e)
+            {
+                // #region agent log
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "N1",
+                    "DestinyChatDesktop.cs:57",
+                    "UI thread exception",
+                    new Dictionary<string, object>
+                    {
+                        { "error", e != null && e.Exception != null ? e.Exception.Message : string.Empty }
+                    });
+                // #endregion
+            };
+            AppDomain.CurrentDomain.UnhandledException += delegate(object sender, UnhandledExceptionEventArgs e)
+            {
+                Exception ex = e != null ? e.ExceptionObject as Exception : null;
+                // #region agent log
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "N1",
+                    "DestinyChatDesktop.cs:72",
+                    "AppDomain unhandled exception",
+                    new Dictionary<string, object>
+                    {
+                        { "isTerminating", e != null && e.IsTerminating },
+                        { "error", ex != null ? ex.Message : Convert.ToString(e != null ? e.ExceptionObject : null) }
+                    });
+                // #endregion
+            };
 
             string[] args = Environment.GetCommandLineArgs();
 
@@ -36,13 +139,18 @@ namespace DestinyChatDesktop
             AppConfig config = AppConfig.Load(configPath);
             AppState state = AppState.Load(statePath);
             bool runSplitSelfTest = Array.Exists(args, arg => string.Equals(arg, "--self-test-split", StringComparison.OrdinalIgnoreCase));
+            bool runPopoutPauseSelfTest = Array.Exists(args, arg => string.Equals(arg, "--self-test-popout-pause", StringComparison.OrdinalIgnoreCase));
+            bool runToolbarSelfTest = Array.Exists(args, arg => string.Equals(arg, "--self-test-toolbar", StringComparison.OrdinalIgnoreCase));
+            bool runDualSelfTest = Array.Exists(args, arg => string.Equals(arg, "--self-test-dual", StringComparison.OrdinalIgnoreCase));
+            bool runBigscreenGeometrySelfTest = Array.Exists(args, arg => string.Equals(arg, "--self-test-bigscreen-geometry", StringComparison.OrdinalIgnoreCase));
+            bool runStreamChatPanelSelfTest = Array.Exists(args, arg => string.Equals(arg, "--self-test-stream-chat-panel", StringComparison.OrdinalIgnoreCase));
 
-            if (runSplitSelfTest && File.Exists(selfTestResultPath))
+            if ((runSplitSelfTest || runDualSelfTest || runBigscreenGeometrySelfTest || runStreamChatPanelSelfTest) && File.Exists(selfTestResultPath))
             {
                 File.Delete(selfTestResultPath);
             }
 
-            Application.Run(new MainForm(storageRoot, statePath, config, state, runSplitSelfTest, selfTestResultPath));
+            Application.Run(new MainForm(storageRoot, statePath, config, state, runSplitSelfTest, runPopoutPauseSelfTest, runToolbarSelfTest, runDualSelfTest, runBigscreenGeometrySelfTest, selfTestResultPath));
         }
     }
 
@@ -220,8 +328,20 @@ namespace DestinyChatDesktop
 
         public void Save(string path)
         {
-            JavaScriptSerializer serializer = new JavaScriptSerializer();
-            File.WriteAllText(path, serializer.Serialize(this));
+            try
+            {
+                JavaScriptSerializer serializer = new JavaScriptSerializer();
+                string dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                }
+                File.WriteAllText(path, serializer.Serialize(this));
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("AppState.Save failed: " + ex);
+            }
         }
     }
 
@@ -319,12 +439,24 @@ namespace DestinyChatDesktop
         private string _pendingNavigation;
         private CoreWebView2Environment _webViewEnvironment;
         private readonly bool _runSplitSelfTest;
+        private readonly bool _runPopoutPauseSelfTest;
+        private readonly bool _runToolbarSelfTest;
+        private readonly bool _runDualSelfTest;
+        private readonly bool _runBigscreenGeometrySelfTest;
         private readonly string _selfTestResultPath;
         private bool _splitSelfTestStarted;
+        private bool _popoutPauseSelfTestStarted;
+        private bool _toolbarSelfTestStarted;
+        private bool _dualSelfTestStarted;
+        private bool _bigscreenGeometrySelfTestStarted;
+        private bool _streamChatPanelSelfTestStarted;
+        private bool _suppressPageEmbedsState;
+        private readonly bool _runStreamChatPanelSelfTest;
         private System.Threading.Tasks.Task _pendingSplitSelfTestTask;
         private bool _dualChatHostEnabled;
         private bool _dualChatHostAvailable;
         private string _dualChatRequestedUrl;
+        private bool _dualChatNavigationInFlight;
         private string _dualChatEmptyMessage;
         private int _dualChatInputTop;
         private int _dualChatPaneLeft;
@@ -332,11 +464,22 @@ namespace DestinyChatDesktop
         private int _dualChatPaneWidth;
         private int _dualChatPaneHeight;
         private bool _dualChatLayoutActive;
+        private string _lastStreamChatSourceJson;
+        private string _lastDualChatLayoutFingerprint;
+        private string _activeStreamPlayerUrl;
+        private string _preferredChatEmbedUrl;
         private int _bigscreenChatTopOffset;
+        private int _bigscreenViewportWidth;
+        private int _bigscreenViewportHeight;
+        private int _embedChatLayoutViewportWidth;
+        private int _embedChatLayoutViewportHeight;
         private bool _isCheckingForUpdates;
         private bool _startupUpdateCheckQueued;
+        private string _lastSnipRequestId;
+        private DateTime _lastSnipRequestUtc;
+        private bool _treatSnipAsProbe;
 
-        public MainForm(string storageRoot, string statePath, AppConfig config, AppState state, bool runSplitSelfTest, string selfTestResultPath)
+        public MainForm(string storageRoot, string statePath, AppConfig config, AppState state, bool runSplitSelfTest, bool runPopoutPauseSelfTest, bool runToolbarSelfTest, bool runDualSelfTest, bool runBigscreenGeometrySelfTest, string selfTestResultPath)
         {
             _storageRoot = storageRoot;
             _statePath = statePath;
@@ -344,8 +487,15 @@ namespace DestinyChatDesktop
             _config = config;
             _state = state;
             _runSplitSelfTest = runSplitSelfTest;
+            _runPopoutPauseSelfTest = runPopoutPauseSelfTest;
+            _runToolbarSelfTest = runToolbarSelfTest;
+            _runDualSelfTest = runDualSelfTest;
+            _runBigscreenGeometrySelfTest = runBigscreenGeometrySelfTest;
+            _runStreamChatPanelSelfTest = Array.Exists(
+                Environment.GetCommandLineArgs(),
+                arg => string.Equals(arg, "--self-test-stream-chat-panel", StringComparison.OrdinalIgnoreCase));
             _selfTestResultPath = selfTestResultPath ?? string.Empty;
-            _pendingNavigation = runSplitSelfTest ? _config.HomeUrl : GetStartupUrl();
+            _pendingNavigation = (runSplitSelfTest || runPopoutPauseSelfTest || runToolbarSelfTest || runDualSelfTest || runBigscreenGeometrySelfTest || _runStreamChatPanelSelfTest) ? _config.HomeUrl : GetStartupUrl();
             _latestBigscreenEmbeds = new List<BigscreenEmbedState>();
             _dualChatInputTop = 0;
             _dualChatPaneLeft = 0;
@@ -353,6 +503,7 @@ namespace DestinyChatDesktop
             _dualChatPaneWidth = 0;
             _dualChatPaneHeight = 0;
             _dualChatLayoutActive = false;
+            _dualChatNavigationInFlight = false;
 
             Text = _config.Title;
             BackColor = Color.FromArgb(18, 18, 18);
@@ -369,10 +520,13 @@ namespace DestinyChatDesktop
             _toolStrip = new ToolStrip();
             _toolStrip.Dock = DockStyle.Top;
             _toolStrip.GripStyle = ToolStripGripStyle.Hidden;
-            _toolStrip.RenderMode = ToolStripRenderMode.System;
+            _toolStrip.RenderMode = ToolStripRenderMode.ManagerRenderMode;
+            _toolStrip.Renderer = new BorderlessToolStripRenderer();
             _toolStrip.BackColor = Color.FromArgb(30, 30, 30);
             _toolStrip.ForeColor = Color.White;
             _toolStrip.Padding = new Padding(6, 4, 6, 4);
+            _toolStrip.AutoSize = false;
+            _toolStrip.Height = 40;
 
             _backButton = CreateGlyphButton("◀", "Back", OnBackClicked);
             _forwardButton = CreateGlyphButton("▶", "Forward", OnForwardClicked);
@@ -399,11 +553,8 @@ namespace DestinyChatDesktop
             _toolStrip.Items.Add(_homeButton);
             _toolStrip.Items.Add(_bigscreenButton);
             _toolStrip.Items.Add(_mediaPopoutButton);
-            _toolStrip.Items.Add(_loginButton);
             _toolStrip.Items.Add(_reloadButton);
-            _toolStrip.Items.Add(_updateButton);
-            _toolStrip.Items.Add(new ToolStripSeparator());
-            _toolStrip.Items.Add(_muteButton);
+            _toolStrip.Items.Add(_browserButton);
             _toolStrip.Items.Add(_pinButton);
             _toolStrip.Items.Add(new ToolStripSeparator());
             _toolStrip.Items.Add(_zoomOutButton);
@@ -423,7 +574,7 @@ namespace DestinyChatDesktop
 
             _bigscreenBarPanel = new Panel();
             _bigscreenBarPanel.Dock = DockStyle.Top;
-            _bigscreenBarPanel.Height = 84;
+            _bigscreenBarPanel.Height = 40;
             _bigscreenBarPanel.BackColor = Color.FromArgb(17, 17, 19);
             _bigscreenBarPanel.Visible = false;
             _bigscreenBarPanel.Resize += OnBigscreenBarPanelResize;
@@ -431,12 +582,13 @@ namespace DestinyChatDesktop
             _bigscreenControlsPanel = new Panel();
             _bigscreenControlsPanel.Dock = DockStyle.None;
             _bigscreenControlsPanel.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
-            _bigscreenControlsPanel.Height = 43;
+            _bigscreenControlsPanel.Height = 0;
             _bigscreenControlsPanel.Margin = new Padding(0);
             _bigscreenControlsPanel.Location = new Point(0, 0);
             _bigscreenControlsPanel.Width = _bigscreenBarPanel.Width;
             _bigscreenControlsPanel.Padding = new Padding(8, 2, 8, 3);
             _bigscreenControlsPanel.BackColor = Color.FromArgb(17, 17, 19);
+            _bigscreenControlsPanel.Visible = false;
 
             _bigscreenRefreshButton = CreateBigscreenActionButton("Refresh", OnBigscreenRefreshClicked);
             _bigscreenRefreshButton.Width = 74;
@@ -483,8 +635,6 @@ namespace DestinyChatDesktop
             _bigscreenBarView.BackColor = Color.FromArgb(17, 17, 19);
             _bigscreenBarView.Visible = false;
 
-            _bigscreenControlsPanel.Controls.Add(_bigscreenCinemaButton);
-            _bigscreenControlsPanel.Controls.Add(_bigscreenRefreshButton);
             _bigscreenEmbedsViewport.Controls.Add(_bigscreenEmbedsUiView);
             _bigscreenEmbedsViewport.Controls.Add(_bigscreenEmbedsPanel);
             _bigscreenEmbedsPanel.Visible = false;
@@ -659,10 +809,14 @@ namespace DestinyChatDesktop
             ToolStripButton button = CreateButton(glyph, clickHandler);
             button.AutoSize = false;
             button.Width = 28;
-            button.Height = 22;
-            button.Margin = new Padding(2, -4, 2, 2);
+            button.Height = 24;
+            button.Margin = new Padding(2, 0, 2, 0);
             button.ToolTipText = toolTipText;
-            button.Font = new Font("Segoe UI Symbol", 8.75f, FontStyle.Regular);
+            button.Font = new Font("Segoe UI Symbol", 9.0f, FontStyle.Regular);
+            if (glyph == "◀" || glyph == "▶")
+            {
+                button.Padding = new Padding(0, 0, 0, 2);
+            }
             return button;
         }
 
@@ -797,24 +951,142 @@ namespace DestinyChatDesktop
         private void ConfigureDualChatView()
         {
             _dualChatView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = true;
-            _dualChatView.CoreWebView2.Settings.AreDevToolsEnabled = false;
+            _dualChatView.CoreWebView2.Settings.AreDevToolsEnabled = true;
             _dualChatView.CoreWebView2.Settings.AreBrowserAcceleratorKeysEnabled = true;
             _dualChatView.CoreWebView2.Settings.IsStatusBarEnabled = false;
             _dualChatView.CoreWebView2.IsMuted = true;
+            try
+            {
+                _dualChatView.CoreWebView2.Settings.UserAgent =
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+            }
+            catch
+            {
+            }
+            _dualChatView.NavigationStarting += OnDualChatNavigationStarting;
+            _dualChatView.NavigationCompleted += OnDualChatNavigationCompleted;
             _dualChatView.CoreWebView2.NewWindowRequested += OnDualChatNewWindowRequested;
 
-            // Inject CSS to hide the YouTube live chat header (shown in popout mode)
-            // so only the message list and input are visible.
+            // Stretch embedded stream chat pages to the host panel bounds and
+            // hide the YouTube live chat header so only the message list/input remain.
             _dualChatView.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(@"
                 (() => {
-                    const style = document.createElement('style');
-                    style.textContent =
-                        'yt-live-chat-header-renderer,' +
-                        '#chat-messages > yt-live-chat-header-renderer,' +
-                        'yt-live-chat-ticker-renderer { display: none !important; }';
-                    document.head
-                        ? document.head.appendChild(style)
-                        : document.addEventListener('DOMContentLoaded', () => document.head.appendChild(style));
+                    const styleId = 'codex-dual-chat-host-style';
+
+                    function applyLayoutCss() {
+                        const hostName = (location.hostname || '').toLowerCase();
+                        const isYouTubeChat = hostName.indexOf('youtube.com') >= 0 || hostName.indexOf('youtu.be') >= 0;
+                        const isKickChat = hostName === 'kick.com' || hostName === 'www.kick.com' || hostName.endsWith('.kick.com');
+                        if (!isYouTubeChat && !isKickChat) {
+                            const existingStyle = document.getElementById(styleId);
+                            if (existingStyle && existingStyle.parentElement) {
+                                existingStyle.parentElement.removeChild(existingStyle);
+                            }
+                            return;
+                        }
+
+                        const kickCssText = [
+                            'html, body {',
+                            '  margin: 0 !important;',
+                            '  padding: 0 !important;',
+                            '  width: 100% !important;',
+                            '  height: 100% !important;',
+                            '  min-width: 0 !important;',
+                            '  min-height: 0 !important;',
+                            '  overflow: auto !important;',
+                            '  -webkit-overflow-scrolling: touch;',
+                            '  background: #0e0e10 !important;',
+                            '}',
+                            '#root, #__next, main, [data-reactroot] {',
+                            '  min-height: 100% !important;',
+                            '  box-sizing: border-box !important;',
+                            '}'
+                        ].join('');
+
+                        const cssText = [
+                            'html, body {',
+                            '  margin: 0 !important;',
+                            '  padding: 0 !important;',
+                            '  width: 100% !important;',
+                            '  height: 100% !important;',
+                            '  min-width: 0 !important;',
+                            '  min-height: 0 !important;',
+                            '  overflow: hidden !important;',
+                            '  background: #111113 !important;',
+                            '}',
+                            'yt-live-chat-header-renderer,',
+                            '#chat-messages > yt-live-chat-header-renderer,',
+                            'yt-live-chat-ticker-renderer {',
+                            '  display: none !important;',
+                            '}',
+                            'yt-live-chat-app,',
+                            'yt-live-chat-renderer,',
+                            'yt-live-chat-renderer #contents,',
+                            'yt-live-chat-renderer #chat,',
+                            'yt-live-chat-renderer #chat-messages,',
+                            'yt-live-chat-renderer #item-scroller,',
+                            'yt-live-chat-renderer #item-list,',
+                            'yt-live-chat-renderer #items,',
+                            'yt-live-chat-renderer #panel-pages,',
+                            'yt-live-chat-message-input-renderer {',
+                            '  width: 100% !important;',
+                            '  max-width: none !important;',
+                            '  min-width: 0 !important;',
+                            '  box-sizing: border-box !important;',
+                            '}',
+                            'yt-live-chat-app,',
+                            'yt-live-chat-renderer {',
+                            '  display: block !important;',
+                            '  width: 100% !important;',
+                            '  height: 100% !important;',
+                            '  min-height: 100% !important;',
+                            '  max-width: none !important;',
+                            '}'
+                        ].join('');
+
+                        const host = document.head || document.documentElement;
+                        if (!host) {
+                            return;
+                        }
+
+                        let style = document.getElementById(styleId);
+                        if (!style) {
+                            style = document.createElement('style');
+                            style.id = styleId;
+                            host.appendChild(style);
+                        }
+
+                        const desired = isYouTubeChat ? cssText : kickCssText;
+                        if (style.textContent !== desired) {
+                            style.textContent = desired;
+                        }
+                    }
+
+                    applyLayoutCss();
+                    document.addEventListener('DOMContentLoaded', applyLayoutCss);
+
+                    if (typeof MutationObserver === 'function') {
+                        let scheduled = false;
+                        const scheduleApply = () => {
+                            if (scheduled) return;
+                            scheduled = true;
+                            (window.requestAnimationFrame || window.setTimeout)(() => {
+                                scheduled = false;
+                                applyLayoutCss();
+                            }, 0);
+                        };
+                        const observer = new MutationObserver(scheduleApply);
+                        const startObserving = () => {
+                            if (document.body) {
+                                observer.observe(document.body, { childList: true, subtree: false });
+                            } else if (document.documentElement) {
+                                observer.observe(document.documentElement, { childList: true, subtree: false });
+                            }
+                        };
+
+                        startObserving();
+                        document.addEventListener('DOMContentLoaded', startObserving);
+                    }
                 })();
             ");
         }
@@ -927,6 +1199,18 @@ namespace DestinyChatDesktop
             }
             catch (Exception ex)
             {
+                // #region agent log
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "N2",
+                    "DestinyChatDesktop.cs:1055",
+                    "Update check exception",
+                    new Dictionary<string, object>
+                    {
+                        { "manual", manual },
+                        { "error", ex.Message }
+                    });
+                // #endregion
                 if (manual)
                 {
                     MessageBox.Show(
@@ -1383,7 +1667,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
                     const styleId = 'codex-split-chat-style';
                     const buttonId = 'codex-split-chat-btn';
-                    const dualButtonId = 'codex-dual-stream-chat-btn';
+                    const dualButtonId = 'codex-stream-chat-btn';
                     const overlayId = 'codex-split-chat-overlay';
                     const dualPaneId = 'codex-dual-stream-pane';
                     const measureId = 'codex-split-chat-measure';
@@ -1399,6 +1683,8 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     let dualChatLayoutScheduled = false;
                     let dualChatInputObserved = null;
                     let dualChatInputResizeObserver = null;
+                    let bigscreenDualModeTimer = null;
+                    let bigscreenDualLayoutKey = '';
                     let splitFocusFilter = null;
                     let renderToken = 0;
                     let splitScrollOffset = 0;
@@ -1439,7 +1725,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                                 background-repeat: no-repeat;
                                 background-position: center;
                                 background-size: 100% 100%;
-                                background-image: url(""data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect x='3.25' y='4.25' width='17.5' height='15.5' rx='1.5' fill='none' stroke='white' stroke-width='1.75'/><path d='M12 4.5v15' stroke='white' stroke-width='1.75' stroke-linecap='round'/><rect x='4.5' y='5.5' width='7' height='13' rx='0.75' fill='rgba(255,255,255,0.35)' stroke='none'/></svg>"");
+                                background-image: url(""data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect x='3.5' y='4.5' width='8.5' height='15' rx='1.2' fill='none' stroke='white' stroke-width='1.4'/><rect x='12' y='4.5' width='8.5' height='15' rx='1.2' fill='none' stroke='white' stroke-width='1.4'/><text x='7.75' y='14.2' text-anchor='middle' font-family='Segoe UI,Arial,sans-serif' font-size='6.6' fill='white'>D</text><text x='16.25' y='14.2' text-anchor='middle' font-family='Segoe UI,Arial,sans-serif' font-size='6.6' fill='white'>K</text></svg>"");
                             }
 
                             #${dualButtonId}.codex-split-chat-active .btn-icon {
@@ -1450,25 +1736,32 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                                 position: relative;
                             }
 
+                            body.codex-dual-chat-enabled #chat-output-frame {
+                                width: 100% !important;
+                                max-width: none !important;
+                                box-sizing: border-box;
+                            }
+
                             #${dualPaneId} {
                                 position: absolute;
                                 top: 0;
                                 right: 0;
                                 bottom: var(--codex-dual-chat-bottom-offset, 0px);
-                                width: 0;
-                                display: none !important;
+                                width: calc((100% - 14px) / 2);
+                                display: none;
+                                flex-direction: column;
                                 overflow: hidden;
-                                background: transparent;
-                                border-left: none;
+                                background: #111113;
+                                border-left: 1px solid rgba(255,255,255,0.08);
                                 box-sizing: border-box;
-                                z-index: -1;
-                                opacity: 0 !important;
-                                visibility: hidden !important;
-                                pointer-events: none !important;
+                                z-index: 7;
+                                opacity: 1;
+                                visibility: visible;
+                                pointer-events: auto;
                             }
 
                             #${dualPaneId}.enabled {
-                                display: none !important;
+                                display: flex !important;
                             }
 
                             #${dualPaneId} .codex-dual-chat-frame {
@@ -1499,6 +1792,66 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
                             #${dualPaneId}.empty .codex-dual-chat-frame {
                                 display: none;
+                            }
+
+                            #${dualPaneId}.codex-dual-chat-host-guest {
+                                pointer-events: none;
+                                background: transparent !important;
+                                border-left-color: transparent !important;
+                            }
+
+                            #${dualPaneId}.codex-dual-chat-host-guest .codex-dual-chat-frame,
+                            #${dualPaneId}.codex-dual-chat-host-guest .codex-dual-chat-empty {
+                                display: none !important;
+                            }
+
+                            #${dualPaneId}.codex-dual-stream-pane--bigscreen-fixed {
+                                position: fixed;
+                                top: 0;
+                                right: 0;
+                                bottom: 0;
+                                width: min(420px, max(280px, calc((100vw - 48px) / 2)));
+                                z-index: 9999;
+                                box-shadow: -2px 0 8px rgba(0, 0, 0, 0.35);
+                            }
+
+                            body.codex-bigscreen-dual-single-chat #chat-wrap,
+                            body.codex-bigscreen-dual-single-chat .chat-wrap {
+                                width: 100% !important;
+                                max-width: 100% !important;
+                                box-sizing: border-box !important;
+                                overflow: hidden !important;
+                            }
+
+                            body.codex-bigscreen-dual-single-chat #chat-output-frame,
+                            body.codex-bigscreen-dual-single-chat .chat-output-frame {
+                                width: 100% !important;
+                                max-width: 100% !important;
+                                box-sizing: border-box !important;
+                            }
+
+                            body.codex-bigscreen-dual-single-chat .codex-bigscreen-dual-hide-target {
+                                display: none !important;
+                                width: 0 !important;
+                                min-width: 0 !important;
+                                max-width: 0 !important;
+                                overflow: hidden !important;
+                                margin: 0 !important;
+                                padding: 0 !important;
+                                border: 0 !important;
+                                flex: 0 0 0 !important;
+                            }
+
+                            body.codex-bigscreen-dual-single-chat .codex-bigscreen-dual-hide-sibling {
+                                display: none !important;
+                                width: 0 !important;
+                                min-width: 0 !important;
+                                max-width: 0 !important;
+                                overflow: hidden !important;
+                                margin: 0 !important;
+                                padding: 0 !important;
+                                border: 0 !important;
+                                flex: 0 0 0 !important;
                             }
 
                             body.codex-dual-chat-enabled #chat-output-frame > .chat-output,
@@ -1676,21 +2029,43 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         }
 
                         if (button.parentElement !== eyeButton.parentElement || button.nextElementSibling !== eyeButton) {
+                            if (button._tippy && typeof button._tippy.destroy === 'function') {
+                                try {
+                                    button._tippy.destroy();
+                                } catch (error) {
+                                }
+                            }
+
                             eyeButton.parentElement.insertBefore(button, eyeButton);
+                        }
+
+                        button.setAttribute('aria-label', 'Split Chat');
+                        button.setAttribute('title', 'Split Chat');
+                        button.setAttribute('data-tippy-content', 'Split Chat');
+                        if (button._tippy && typeof button._tippy.setContent === 'function') {
+                            button._tippy.setContent('Split Chat');
                         }
 
                         return button;
                     }
 
                     function ensureDualButton() {
-                        const externalButton = document.getElementById('codex-ext-panel-btn');
-                        const snipButton = document.getElementById('codex-snip-btn');
-                        const splitButton = document.getElementById(buttonId);
-                        const fallbackRef = document.getElementById('chat-watching-focus-btn')
-                            || document.getElementById('chat-settings-btn');
-                        const ref = externalButton || fallbackRef || splitButton;
-                        if (!ref || !ref.parentElement) {
+                        const eyeButton = document.getElementById('chat-watching-focus-btn');
+                        const settingsButton = document.getElementById('chat-settings-btn');
+                        const anchorBefore = eyeButton || settingsButton;
+                        if (!anchorBefore || !anchorBefore.parentElement) {
                             return null;
+                        }
+
+                        const toolbarRoot = anchorBefore.parentElement;
+
+                        const staleSteamButton = document.getElementById('codex-steam-chat-btn');
+                        if (staleSteamButton && staleSteamButton.parentElement) {
+                            staleSteamButton.parentElement.removeChild(staleSteamButton);
+                        }
+                        const staleDualButton = document.getElementById('codex-dual-stream-chat-btn');
+                        if (staleDualButton && staleDualButton.parentElement) {
+                            staleDualButton.parentElement.removeChild(staleDualButton);
                         }
 
                         let btn = document.getElementById(dualButtonId);
@@ -1699,8 +2074,9 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             btn.id = dualButtonId;
                             btn.className = 'chat-tool-btn';
                             btn.setAttribute('role', 'button');
-                            btn.title = 'Dual Chat';
-                            btn.setAttribute('data-tippy-content', 'Dual Chat');
+                            btn.setAttribute('aria-label', 'Stream Chat');
+                            btn.setAttribute('title', 'Stream Chat');
+                            btn.setAttribute('data-tippy-content', 'Stream Chat');
                             btn.innerHTML = '<i class=""btn-icon""></i>';
                             btn.addEventListener('click', (event) => {
                                 event.preventDefault();
@@ -1709,33 +2085,28 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             });
                         }
 
-                        if (externalButton && externalButton.parentElement === ref.parentElement) {
-                            if (btn.parentElement !== ref.parentElement || btn.nextElementSibling !== externalButton) {
-                                ref.parentElement.insertBefore(btn, externalButton);
-                            }
-                        } else if (snipButton && snipButton.parentElement === ref.parentElement) {
-                            const insertBeforeNode = snipButton.nextSibling === btn ? btn.nextSibling : snipButton.nextSibling;
-                            if (btn.parentElement !== ref.parentElement || btn.previousElementSibling !== snipButton) {
-                                if (insertBeforeNode) {
-                                    ref.parentElement.insertBefore(btn, insertBeforeNode);
-                                } else {
-                                    ref.parentElement.appendChild(btn);
+                        // Place only relative to the native focus/eye control — never relative to split chat.
+                        // That avoids reorder bugs when Tippy or the site injects nodes between toolbar buttons.
+                        const placementOk = btn.parentElement === toolbarRoot
+                            && btn.nextElementSibling === anchorBefore;
+                        if (!placementOk) {
+                            if (btn._tippy && typeof btn._tippy.destroy === 'function') {
+                                try {
+                                    btn._tippy.destroy();
+                                } catch (error) {
                                 }
                             }
-                        } else if (splitButton && splitButton.parentElement === ref.parentElement) {
-                            const insertBeforeNode = splitButton.nextSibling === btn ? btn.nextSibling : splitButton.nextSibling;
-                            if (btn.parentElement !== ref.parentElement || btn.previousElementSibling !== splitButton) {
-                                if (insertBeforeNode) {
-                                    ref.parentElement.insertBefore(btn, insertBeforeNode);
-                                } else {
-                                    ref.parentElement.appendChild(btn);
-                                }
-                            }
-                        } else if (btn.parentElement !== ref.parentElement || btn.nextElementSibling !== ref) {
-                            ref.parentElement.insertBefore(btn, ref);
+
+                            toolbarRoot.insertBefore(btn, anchorBefore);
                         }
 
-                        syncDualChatButton();
+                        btn.setAttribute('aria-label', 'Stream Chat');
+                        btn.setAttribute('title', 'Stream Chat');
+                        btn.setAttribute('data-tippy-content', 'Stream Chat');
+                        if (btn._tippy && typeof btn._tippy.setContent === 'function') {
+                            btn._tippy.setContent('Stream Chat');
+                        }
+
                         return btn;
                     }
 
@@ -2775,7 +3146,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             }
                         }
 
-                        if (!payload || payload.type !== 'codex-dual-chat-source') {
+                        if (!payload || (payload.type !== 'codex-stream-chat-source' && payload.type !== 'codex-dual-chat-source')) {
                             return null;
                         }
 
@@ -2813,16 +3184,138 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         });
                     }
 
+                    function reportEmbedPanelToHost() {
+                        const host = window.chrome && window.chrome.webview;
+                        if (!host || typeof host.postMessage !== 'function') {
+                            return;
+                        }
+
+                        function normalizeHref(rawValue) {
+                            if (!rawValue) {
+                                return null;
+                            }
+
+                            try {
+                                return new URL(rawValue, window.location.href).href;
+                            } catch (error) {
+                                return null;
+                            }
+                        }
+
+                        const anchors = Array.from(document.querySelectorAll(
+                            '#chat-panel-embeds a.embed-link, .chat-embeds a.embed-link, #embeds-panel a.embed-link'));
+                        const items = anchors.map((anchor) => {
+                            const textElement = anchor.querySelector('.embed-link__text');
+                            const href = normalizeHref(anchor.getAttribute('href') || anchor.href);
+                            if (!href) {
+                                return null;
+                            }
+
+                            return {
+                                url: href,
+                                platform: anchor.getAttribute('data-platform') || '',
+                                mediaId: anchor.getAttribute('data-id') || anchor.getAttribute('data-mediaid') || '',
+                                text: ((textElement ? textElement.textContent : anchor.textContent) || '')
+                                    .replace(/\s+/g, ' ')
+                                    .trim(),
+                                title: anchor.getAttribute('title') || '',
+                                selected: anchor.classList.contains('embed-link--selected')
+                            };
+                        }).filter((item) => !!item);
+
+                        function getActiveStreamPlayerUrl() {
+                            const frames = Array.from(document.querySelectorAll('iframe'));
+                            function srcOf(f) {
+                                return String(f && (f.getAttribute('src') || f.src) || '').trim();
+                            }
+                            for (let i = 0; i < frames.length; i++) {
+                                const s = srcOf(frames[i]).toLowerCase();
+                                if (s && s.indexOf('player.kick.com') >= 0) {
+                                    return srcOf(frames[i]);
+                                }
+                            }
+                            for (let i = 0; i < frames.length; i++) {
+                                const s = srcOf(frames[i]).toLowerCase();
+                                if (s && s.indexOf('player.twitch') >= 0) {
+                                    return srcOf(frames[i]);
+                                }
+                            }
+                            for (let i = 0; i < frames.length; i++) {
+                                const s = srcOf(frames[i]).toLowerCase();
+                                if (s && (s.indexOf('youtube.com/embed') >= 0 || s.indexOf('youtube-nocookie.com/embed') >= 0)) {
+                                    return srcOf(frames[i]);
+                                }
+                            }
+                            for (let i = 0; i < frames.length; i++) {
+                                const s = srcOf(frames[i]).toLowerCase();
+                                if (s && s.indexOf('kick.com') >= 0 && s.indexOf('player.kick.com') < 0) {
+                                    return srcOf(frames[i]);
+                                }
+                            }
+                            return '';
+                        }
+
+                        const activeStreamUrl = getActiveStreamPlayerUrl() || '';
+                        const fp = JSON.stringify({ items: items, activeStreamUrl: activeStreamUrl });
+                        if (window.__codexLastEmbedFingerprint === fp) {
+                            return;
+                        }
+                        window.__codexLastEmbedFingerprint = fp;
+
+                        host.postMessage({
+                            type: 'embedsState',
+                            items: items,
+                            activeStreamUrl: activeStreamUrl
+                        });
+                    }
+
+                    let codexEmbedHostSyncTimer = 0;
+                    function scheduleEmbedPanelReport() {
+                        window.clearTimeout(codexEmbedHostSyncTimer);
+                        codexEmbedHostSyncTimer = window.setTimeout(reportEmbedPanelToHost, 200);
+                    }
+
+                    function startEmbedListHostSync() {
+                        if (window.__codexEmbedHostSyncStarted) {
+                            return;
+                        }
+
+                        window.__codexEmbedHostSyncStarted = true;
+                        window.setInterval(reportEmbedPanelToHost, 5000);
+                        window.addEventListener('load', () => {
+                            scheduleEmbedPanelReport();
+                            window.setTimeout(reportEmbedPanelToHost, 1200);
+                        });
+                        if (document.documentElement && typeof MutationObserver === 'function') {
+                            const embedMo = new MutationObserver(() => scheduleEmbedPanelReport());
+                            embedMo.observe(document.documentElement, {
+                                childList: true,
+                                subtree: true,
+                                attributes: true,
+                                attributeFilter: ['class', 'href']
+                            });
+                        }
+                    }
+
                     function requestDualChatSource() {
+                        reportEmbedPanelToHost();
                         const host = window.chrome && window.chrome.webview;
                         if (host && typeof host.postMessage === 'function') {
-                            host.postMessage({ type: 'codex-dual-chat-request' });
+                            host.postMessage({ type: 'codex-stream-chat-request' });
                         }
                     }
 
                     function ensureDualChatPane() {
-                        const frame = document.getElementById('chat-output-frame');
-                        if (!frame) {
+                        const onBigscreen = window.location.pathname && window.location.pathname.indexOf('/bigscreen') >= 0;
+                        const hostLiftsStreamChat = !!(window.chrome && window.chrome.webview);
+                        let anchor = document.getElementById('chat-output-frame');
+                        let fixedToBody = false;
+                        if (!anchor && onBigscreen && !hostLiftsStreamChat) {
+                            anchor = document.body;
+                            fixedToBody = true;
+                        }
+
+                        if (!anchor) {
                             return null;
                         }
 
@@ -2833,9 +3326,21 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             pane.innerHTML =
                                 '<iframe class=""codex-dual-chat-frame"" allow=""autoplay; clipboard-write"" sandbox=""allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox""></iframe>' +
                                 '<div class=""codex-dual-chat-empty""></div>';
-                            frame.appendChild(pane);
-                        } else if (pane.parentElement !== frame) {
-                            frame.appendChild(pane);
+                            anchor.appendChild(pane);
+                            if (fixedToBody) {
+                                pane.classList.add('codex-dual-stream-pane--bigscreen-fixed');
+                            }
+                        } else if (fixedToBody) {
+                            if (pane.parentElement !== document.body) {
+                                document.body.appendChild(pane);
+                            }
+
+                            pane.classList.add('codex-dual-stream-pane--bigscreen-fixed');
+                        } else {
+                            pane.classList.remove('codex-dual-stream-pane--bigscreen-fixed');
+                            if (pane.parentElement !== anchor) {
+                                anchor.appendChild(pane);
+                            }
                         }
 
                         return pane;
@@ -2854,31 +3359,73 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         if (!btn) {
                             return;
                         }
-
                         btn.classList.toggle('codex-split-chat-active', !!dualChatEnabled);
-                        btn.style.opacity = dualChatSource && dualChatSource.available ? '' : '0.78';
+                    }
+
+                    function getDualChatBottomAnchors() {
+                        const selectors = [
+                            '#chat-input-frame',
+                            '#chat-input-wrap',
+                            '#chat-input-control',
+                            '#chat-tools-wrap',
+                            '.chat-tools-group'
+                        ];
+                        const anchors = [];
+                        for (const selector of selectors) {
+                            const matches = Array.from(document.querySelectorAll(selector));
+                            for (const match of matches) {
+                                if (match instanceof Element && anchors.indexOf(match) < 0) {
+                                    anchors.push(match);
+                                }
+                            }
+                        }
+                        return anchors;
+                    }
+
+                    function getDualChatBottomChromeTop() {
+                        const anchors = getDualChatBottomAnchors();
+                        let top = 0;
+                        for (const anchor of anchors) {
+                            const rect = anchor.getBoundingClientRect();
+                            if (rect.height <= 2 || rect.width <= 2 || rect.bottom <= 0 || rect.top >= window.innerHeight) {
+                                continue;
+                            }
+
+                            if (rect.bottom < Math.max(48, window.innerHeight * 0.45)) {
+                                continue;
+                            }
+
+                            if (top <= 0 || rect.top < top) {
+                                top = rect.top;
+                            }
+                        }
+
+                        return top;
                     }
 
                     function bindDualChatInputResizeObserver() {
-                        const inputAnchor = document.querySelector('#chat-input-control')
-                            || document.querySelector('#chat-input-wrap')
-                            || document.querySelector('#chat-input-frame');
-                        if (dualChatInputObserved === inputAnchor) {
+                        const anchors = getDualChatBottomAnchors();
+                        const signature = anchors.map((anchor, index) => {
+                            return `${index}:${anchor.id || anchor.className || anchor.tagName}`;
+                        }).join('|');
+                        if (dualChatInputObserved === signature) {
                             return;
                         }
 
-                        dualChatInputObserved = inputAnchor;
+                        dualChatInputObserved = signature;
                         if (dualChatInputResizeObserver) {
                             dualChatInputResizeObserver.disconnect();
                         }
 
-                        if (inputAnchor instanceof Element && typeof ResizeObserver === 'function') {
+                        if (anchors.length > 0 && typeof ResizeObserver === 'function') {
                             dualChatInputResizeObserver = new ResizeObserver(() => {
                                 scheduleDualChatLayoutReport();
                             });
-                            dualChatInputResizeObserver.observe(inputAnchor);
-                            if (inputAnchor.parentElement) {
-                                dualChatInputResizeObserver.observe(inputAnchor.parentElement);
+                            for (const anchor of anchors) {
+                                dualChatInputResizeObserver.observe(anchor);
+                                if (anchor.parentElement) {
+                                    dualChatInputResizeObserver.observe(anchor.parentElement);
+                                }
                             }
                         }
                     }
@@ -2888,32 +3435,58 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
                         const root = document.documentElement;
                         const frame = document.getElementById('chat-output-frame');
-                        const inputAnchor = document.querySelector('#chat-input-control')
-                            || document.querySelector('#chat-input-wrap')
-                            || document.querySelector('#chat-input-frame');
+                        const sourceOutput = getActiveOutput();
                         let inputTop = 0;
                         let bottomOffset = 0;
                         let paneLeft = 0;
                         let paneTop = 0;
                         let paneWidth = 0;
                         let paneHeight = 0;
-                        const layoutActive = !!dualChatEnabled && document.body.classList.contains('codex-dual-chat-enabled');
+                        let layoutActive = !!dualChatEnabled && document.body.classList.contains('codex-dual-chat-enabled');
 
-                        if (inputAnchor instanceof Element) {
-                            const rect = inputAnchor.getBoundingClientRect();
-                            if (rect.height > 0 && rect.top < window.innerHeight) {
-                                inputTop = Math.max(0, Math.round(rect.top));
-                                bottomOffset = Math.max(0, Math.round(window.innerHeight - rect.top));
-                            }
+                        const bottomChromeTop = getDualChatBottomChromeTop();
+                        if (bottomChromeTop > 0) {
+                            inputTop = Math.max(0, Math.round(bottomChromeTop - 10));
+                            bottomOffset = Math.max(0, Math.round(window.innerHeight - inputTop));
                         }
 
-                        if (layoutActive && frame instanceof Element) {
+                        if (frame instanceof Element) {
                             const frameRect = frame.getBoundingClientRect();
-                            if (frameRect.width > 0 && inputTop > frameRect.top) {
+                            const outputRect = sourceOutput instanceof Element
+                                ? sourceOutput.getBoundingClientRect()
+                                : null;
+                            const expectedPaneWidth = frameRect.width > 0
+                                ? Math.max(0, (frameRect.width - 14) / 2)
+                                : 0;
+                            const widthTolerance = Math.max(32, Math.round(frameRect.width * 0.06));
+                            const outputLooksSplit = !!(outputRect &&
+                                outputRect.width > 0 &&
+                                expectedPaneWidth > 0 &&
+                                Math.abs(outputRect.width - expectedPaneWidth) <= widthTolerance);
+
+                            const hostLiftsStreamChat = !!(window.chrome && window.chrome.webview);
+                            if (layoutActive && !hostLiftsStreamChat) {
+                                layoutActive = layoutActive && outputLooksSplit;
+                            }
+
+                            if (frameRect.width > 0) {
                                 paneWidth = Math.max(0, Math.round((frameRect.width - 14) / 2));
-                                paneTop = Math.max(0, Math.round(frameRect.top));
                                 paneLeft = Math.max(0, Math.round(frameRect.right - paneWidth));
-                                paneHeight = Math.max(0, Math.round(inputTop - frameRect.top));
+
+                                let topBound = frameRect.top;
+                                let bottomBound = inputTop > frameRect.top ? inputTop : frameRect.bottom;
+
+                                if (outputRect && outputRect.height > 0) {
+                                    topBound = Math.max(topBound, outputRect.top);
+                                    if (inputTop > 0) {
+                                        bottomBound = Math.min(bottomBound, inputTop);
+                                    } else {
+                                        bottomBound = Math.min(bottomBound, outputRect.bottom);
+                                    }
+                                }
+
+                                paneTop = Math.max(0, Math.round(topBound));
+                                paneHeight = Math.max(0, Math.round(bottomBound - topBound));
                             }
                         }
 
@@ -2931,7 +3504,9 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                                 paneLeft: paneLeft,
                                 paneTop: paneTop,
                                 paneWidth: paneWidth,
-                                paneHeight: paneHeight
+                                paneHeight: paneHeight,
+                                windowWidth: window.innerWidth | 0,
+                                windowHeight: window.innerHeight | 0
                             });
                         }
                     }
@@ -2959,91 +3534,267 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     }
 
                     function notifyDualChatHostState() {
+                        // Stream chat feature removed.
+                    }
+
+                    function notifyStreamChatHostToggle(enabled) {
                         const host = window.chrome && window.chrome.webview;
                         if (!host || typeof host.postMessage !== 'function') {
                             return;
                         }
-
-                        const available = !!(dualChatSource && dualChatSource.available && dualChatSource.chatUrl);
                         host.postMessage({
-                            type: 'codex-dual-chat-state',
-                            enabled: !!dualChatEnabled,
-                            available: available,
-                            chatUrl: available ? dualChatSource.chatUrl : '',
-                            message: available ? '' : getDualChatUnavailableText()
+                            type: 'codex-stream-chat-toggle',
+                            enabled: !!enabled
                         });
                     }
 
+                    function isBigscreenDualLayoutActive() {
+                        if (window.location && window.location.pathname &&
+                            window.location.pathname.indexOf('/bigscreen') >= 0) {
+                            return true;
+                        }
+                        const chatWrap = document.querySelector('#chat-wrap') || document.querySelector('.chat-wrap');
+                        if (!chatWrap || !chatWrap.parentElement) {
+                            return false;
+                        }
+                        const siblings = Array.from(chatWrap.parentElement.children).filter((node) => node && node !== chatWrap);
+                        if (!siblings.length) {
+                            return false;
+                        }
+                        for (const sibling of siblings) {
+                            if (!(sibling instanceof HTMLElement)) {
+                                continue;
+                            }
+                            const rect = sibling.getBoundingClientRect();
+                            if (rect.width > 40 && rect.height > 40) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+
+                    function applyBigscreenDualMode(enabled) {
+                        const inBigscreenDualLayout = isBigscreenDualLayoutActive();
+                        if (!inBigscreenDualLayout || !document.body) {
+                            if (bigscreenDualModeTimer) {
+                                window.clearInterval(bigscreenDualModeTimer);
+                                bigscreenDualModeTimer = null;
+                            }
+                            document.body && document.body.classList.remove('codex-bigscreen-dual-single-chat');
+                            return;
+                        }
+
+                        const applyTargets = () => {
+                            const streamChatEnabled = !!enabled;
+                            document.body.classList.toggle('codex-bigscreen-dual-single-chat', !streamChatEnabled);
+                            const chatWrap = document.querySelector('#chat-wrap') || document.querySelector('.chat-wrap');
+                            if (chatWrap && chatWrap.parentElement) {
+                                const siblings = Array.from(chatWrap.parentElement.children);
+                                for (const sibling of siblings) {
+                                    if (!sibling || sibling === chatWrap) {
+                                        continue;
+                                    }
+                                    if (!streamChatEnabled) {
+                                        sibling.classList.add('codex-bigscreen-dual-hide-sibling');
+                                    } else {
+                                        sibling.classList.remove('codex-bigscreen-dual-hide-sibling');
+                                    }
+                                }
+                            }
+
+                            const frames = Array.from(document.querySelectorAll('iframe'));
+                            for (const frame of frames) {
+                                if (!frame || frame.closest('#' + dualPaneId)) {
+                                    continue;
+                                }
+                                const src = (frame.getAttribute('src') || frame.src || '').toLowerCase();
+                                if (!src || src.indexOf('kick.com') < 0) {
+                                    continue;
+                                }
+
+                                let target = frame;
+                                let parent = frame.parentElement;
+                                let depth = 0;
+                                while (parent && depth < 5 && parent !== document.body && parent !== document.documentElement) {
+                                    if (parent.querySelector('#chat-wrap')) {
+                                        break;
+                                    }
+                                    target = parent;
+                                    parent = parent.parentElement;
+                                    depth += 1;
+                                }
+
+                                if (!streamChatEnabled) {
+                                    target.classList.add('codex-bigscreen-dual-hide-target');
+                                } else {
+                                    target.classList.remove('codex-bigscreen-dual-hide-target');
+                                }
+                            }
+                        };
+
+                        applyTargets();
+                        if (enabled) {
+                            if (!bigscreenDualModeTimer) {
+                                bigscreenDualModeTimer = window.setInterval(applyTargets, 1000);
+                            }
+                        } else if (bigscreenDualModeTimer) {
+                            window.clearInterval(bigscreenDualModeTimer);
+                            bigscreenDualModeTimer = null;
+                        }
+                    }
+
+                    function normalizeChatUrlForCompare(rawUrl) {
+                        if (!rawUrl) {
+                            return '';
+                        }
+                        try {
+                            const parsed = new URL(String(rawUrl), window.location.href);
+                            parsed.hash = '';
+                            let normalized = parsed.toString();
+                            if (normalized.endsWith('/')) {
+                                normalized = normalized.slice(0, -1);
+                            }
+                            return normalized.toLowerCase();
+                        } catch (error) {
+                            return String(rawUrl).trim().toLowerCase();
+                        }
+                    }
+
+                    function isChatUrlAlreadyEmbedded(chatUrl, ignoreFrame) {
+                        if (!chatUrl) {
+                            return false;
+                        }
+                        const expected = normalizeChatUrlForCompare(chatUrl);
+                        if (!expected) {
+                            return false;
+                        }
+                        const iframes = Array.from(document.querySelectorAll('iframe'));
+                        for (const frame of iframes) {
+                            if (!frame || frame === ignoreFrame) {
+                                continue;
+                            }
+                            const src = frame.getAttribute('src') || frame.src || '';
+                            if (!src) {
+                                continue;
+                            }
+                            const current = normalizeChatUrlForCompare(src);
+                            if (current && current === expected) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+
                     function updateDualChatPane() {
+                        syncDualChatButton();
+
+                        const hostLiftsStreamChat = !!(window.chrome && window.chrome.webview);
                         const pane = ensureDualChatPane();
                         if (!pane) {
+                            scheduleDualChatLayoutReport();
                             return;
+                        }
+
+                        const iframe = pane.querySelector('.codex-dual-chat-frame');
+                        const emptyEl = pane.querySelector('.codex-dual-chat-empty');
+
+                        if (!dualChatEnabled) {
+                            pane.classList.remove('enabled', 'empty', 'codex-dual-chat-host-guest', 'codex-dual-stream-pane--bigscreen-fixed');
+                            pane.removeAttribute('data-codex-chat-url');
+                            if (iframe instanceof HTMLIFrameElement) {
+                                iframe.setAttribute('src', 'about:blank');
+                            }
+
+                            if (emptyEl instanceof HTMLElement) {
+                                emptyEl.textContent = '';
+                            }
+
+                            scheduleDualChatLayoutReport();
+                            return;
+                        }
+
+                        const chatUrl = dualChatSource && dualChatSource.chatUrl ? String(dualChatSource.chatUrl) : '';
+                        const available = !!(dualChatSource && dualChatSource.available && chatUrl);
+
+                        if (!available) {
+                            pane.classList.remove('codex-dual-chat-host-guest');
+                            pane.classList.add('empty');
+                            pane.classList.remove('enabled');
+                            pane.removeAttribute('data-codex-chat-url');
+                            if (iframe instanceof HTMLIFrameElement) {
+                                iframe.setAttribute('src', 'about:blank');
+                            }
+
+                            if (emptyEl instanceof HTMLElement) {
+                                emptyEl.textContent = getDualChatUnavailableText();
+                            }
+
+                            scheduleDualChatLayoutReport();
+                            return;
+                        }
+
+                        if (hostLiftsStreamChat) {
+                            pane.classList.add('enabled');
+                            pane.classList.remove('empty');
+                            pane.classList.add('codex-dual-chat-host-guest');
+                            pane.setAttribute('data-codex-chat-url', chatUrl);
+                            if (iframe instanceof HTMLIFrameElement) {
+                                iframe.setAttribute('src', 'about:blank');
+                            }
+
+                            if (emptyEl instanceof HTMLElement) {
+                                emptyEl.textContent = '';
+                            }
+
+                            scheduleDualChatLayoutReport();
+                            return;
+                        }
+
+                        if (isChatUrlAlreadyEmbedded(chatUrl, iframe instanceof HTMLIFrameElement ? iframe : null)) {
+                            pane.classList.remove('enabled', 'codex-dual-chat-host-guest');
+                            pane.classList.add('empty');
+                            if (iframe instanceof HTMLIFrameElement) {
+                                iframe.setAttribute('src', 'about:blank');
+                            }
+
+                            if (emptyEl instanceof HTMLElement) {
+                                emptyEl.textContent = 'Stream chat is already open in another embed.';
+                            }
+
+                            scheduleDualChatLayoutReport();
+                            return;
+                        }
+
+                        pane.classList.add('enabled');
+                        pane.classList.remove('empty', 'codex-dual-chat-host-guest');
+                        pane.setAttribute('data-codex-chat-url', chatUrl);
+                        if (iframe instanceof HTMLIFrameElement) {
+                            const currentSrc = iframe.getAttribute('src') || iframe.src || '';
+                            if (normalizeChatUrlForCompare(currentSrc) !== normalizeChatUrlForCompare(chatUrl)) {
+                                iframe.setAttribute('src', chatUrl);
+                            }
+                        }
+
+                        if (emptyEl instanceof HTMLElement) {
+                            emptyEl.textContent = '';
                         }
 
                         scheduleDualChatLayoutReport();
-
-                        const iframe = pane.querySelector('.codex-dual-chat-frame');
-                        const empty = pane.querySelector('.codex-dual-chat-empty');
-                        const desiredChatUrl = dualChatSource && dualChatSource.available && dualChatSource.chatUrl
-                            ? dualChatSource.chatUrl
-                            : '';
-                        pane.setAttribute('data-codex-chat-url', desiredChatUrl);
-                        pane.classList.toggle('enabled', !!dualChatEnabled);
-                        document.body.classList.toggle('codex-dual-chat-enabled', !!dualChatEnabled);
-
-                        if (!dualChatEnabled) {
-                            pane.classList.remove('empty');
-                            if (iframe && iframe.getAttribute('src') !== 'about:blank') {
-                                iframe.setAttribute('src', 'about:blank');
-                            }
-                            syncDualChatButton();
-                            notifyDualChatHostState();
-                            return;
-                        }
-
-                        if (dualChatSource && dualChatSource.available && dualChatSource.chatUrl) {
-                            pane.classList.remove('empty');
-                            if (empty) {
-                                empty.textContent = '';
-                            }
-                            if (iframe && iframe.getAttribute('src') !== 'about:blank') {
-                                iframe.setAttribute('src', 'about:blank');
-                            }
-                        } else {
-                            pane.classList.add('empty');
-                            if (iframe && iframe.getAttribute('src') !== 'about:blank') {
-                                iframe.setAttribute('src', 'about:blank');
-                            }
-                            if (empty) {
-                                empty.textContent = getDualChatUnavailableText();
-                            }
-                        }
-
-                        syncDualChatButton();
-                        notifyDualChatHostState();
                     }
 
                     function setDualChatEnabled(enabled, refreshSource) {
                         dualChatEnabled = !!enabled;
-                        if (dualChatEnabled) {
-                            if (splitEnabled) {
-                                setSplitEnabled(false, false);
-                            }
-
-                            const closeExternalPanel = window.__codexCloseExtPanel;
-                            if (typeof closeExternalPanel === 'function') {
-                                try {
-                                    closeExternalPanel();
-                                } catch (error) {
-                                }
-                            }
+                        if (document.body) {
+                            document.body.classList.toggle('codex-dual-chat-enabled', dualChatEnabled);
                         }
 
+                        notifyStreamChatHostToggle(dualChatEnabled);
                         if (refreshSource || dualChatEnabled) {
                             requestDualChatSource();
                         }
 
                         updateDualChatPane();
+                        scheduleDualChatLayoutReport();
                     }
 
                     function exposeCodexHarness() {
@@ -3102,6 +3853,10 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
                     function bootstrap() {
                         ensureStyles();
+                        const staleDualButton = document.getElementById('codex-dual-stream-chat-btn');
+                        if (staleDualButton && staleDualButton.parentElement) {
+                            staleDualButton.parentElement.removeChild(staleDualButton);
+                        }
                         try {
                             ensureDualChatMessageBridge();
                         } catch (error) {
@@ -3121,6 +3876,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         bindDualChatLayout();
                         bindFrameObservers();
                         applySavedState();
+                        startEmbedListHostSync();
                         return true;
                     }
 
@@ -3180,6 +3936,9 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     // ── Shared WebSocket interceptor ─────────────────────────────
                     const wsListeners = [];
                     function onWsMsg(cb) { wsListeners.push(cb); }
+                    window.__codexEmitWsTest = function(payload) {
+                        wsListeners.forEach(fn => { try { fn(payload); } catch {} });
+                    };
                     if (!window.__codexWsPatched) {
                         window.__codexWsPatched = true;
                         const NativeWS = window.WebSocket;
@@ -3245,16 +4004,84 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             icon: 'https://cdn.destiny.gg/2.49.0/emotes/6296cf7e8ccd0.png'
                         });
                     }
+                    let mentionDingAudioCtx = null;
+                    let lastMentionDingAt = 0;
+                    function normalizeNickValue(value) {
+                        return String(value || '').trim().toLowerCase().replace(/^@+/, '');
+                    }
+                    function resolveMentionTargetNick() {
+                        const configured = normalizeNickValue(xGet('mentions.username', ''));
+                        if (configured) return configured;
+                        const domCandidates = [
+                            document.body?.getAttribute('data-username'),
+                            document.documentElement?.getAttribute('data-username'),
+                            document.querySelector('[data-current-user]')?.getAttribute('data-current-user'),
+                            document.querySelector('[data-username][data-current-user]')?.getAttribute('data-username')
+                        ];
+                        for (const candidate of domCandidates) {
+                            const normalized = normalizeNickValue(candidate);
+                            if (normalized) return normalized;
+                        }
+                        const watched = getWatched();
+                        if (Array.isArray(watched) && watched.length) {
+                            return normalizeNickValue(watched[0]);
+                        }
+                        return '';
+                    }
+                    function hasMentionForTarget(messageNode, targetNick) {
+                        if (!messageNode || !targetNick) return false;
+                        const mentionedAttr = normalizeNickValue(messageNode.getAttribute('data-mentioned') || '');
+                        if (mentionedAttr) {
+                            const mentionedValues = mentionedAttr.split(/\s+/).map(normalizeNickValue).filter(Boolean);
+                            if (mentionedValues.includes(targetNick)) return true;
+                        }
+                        const text = String(messageNode.querySelector('.text')?.textContent || messageNode.textContent || '').toLowerCase();
+                        if (!text) return false;
+                        if (text.indexOf('@' + targetNick) >= 0) return true;
+                        return new RegExp('(^|\\W)' + targetNick.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(\\W|$)', 'i').test(text);
+                    }
+                    function playMentionDing() {
+                        if (!xGet('mentions.ding.enabled', true)) return;
+                        const now = Date.now();
+                        if ((now - lastMentionDingAt) < 900) return;
+                        lastMentionDingAt = now;
+                        try {
+                            const AudioCtx = window.AudioContext || window.webkitAudioContext;
+                            if (!AudioCtx) return;
+                            mentionDingAudioCtx = mentionDingAudioCtx || new AudioCtx();
+                            if (mentionDingAudioCtx.state === 'suspended') {
+                                mentionDingAudioCtx.resume();
+                            }
+                            const osc = mentionDingAudioCtx.createOscillator();
+                            const gain = mentionDingAudioCtx.createGain();
+                            osc.type = 'sine';
+                            osc.frequency.setValueAtTime(880, mentionDingAudioCtx.currentTime);
+                            osc.frequency.exponentialRampToValueAtTime(1320, mentionDingAudioCtx.currentTime + 0.12);
+                            gain.gain.setValueAtTime(0.0001, mentionDingAudioCtx.currentTime);
+                            gain.gain.exponentialRampToValueAtTime(0.12, mentionDingAudioCtx.currentTime + 0.01);
+                            gain.gain.exponentialRampToValueAtTime(0.0001, mentionDingAudioCtx.currentTime + 0.2);
+                            osc.connect(gain);
+                            gain.connect(mentionDingAudioCtx.destination);
+                            osc.start();
+                            osc.stop(mentionDingAudioCtx.currentTime + 0.21);
+                        } catch (error) {
+                        }
+                    }
                     function watchMsgNotify() {
                         const lines = document.querySelector('.chat-lines');
                         if (!lines) return;
                         new MutationObserver(muts => {
+                            const mentionTarget = resolveMentionTargetNick();
                             for (const m of muts) {
                                 for (const n of m.addedNodes) {
                                     if (!(n instanceof Element) || !n.classList.contains('msg-user')) continue;
                                     const nick = n.getAttribute('data-username') || '';
-                                    if (!isWatched(nick)) continue;
-                                    maybeNotify(nick, n.querySelector('.text')?.textContent?.trim() || '');
+                                    if (isWatched(nick)) {
+                                        maybeNotify(nick, n.querySelector('.text')?.textContent?.trim() || '');
+                                    }
+                                    if (mentionTarget && hasMentionForTarget(n, mentionTarget)) {
+                                        playMentionDing();
+                                    }
                                 }
                             }
                         }).observe(lines, { childList: true });
@@ -3262,6 +4089,54 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
                     // ── Feature 3: DinkDonk button ───────────────────────────────
                     let ddTimer = null;
+                    let ddLastAutoOpenUrl = '';
+                    let ddLastAutoOpenAt = 0;
+                    function isDinkDonkAnnouncer(nick) {
+                        if (!nick) return false;
+                        const norm = String(nick).toLowerCase().replace(/[^a-z0-9]/g, '');
+                        return norm === 'dinkdonkbot';
+                    }
+                    function extractDinkDonkUrl(raw) {
+                        if (typeof raw !== 'string' || !raw) return '';
+                        const text = String(raw);
+                        const full = text.match(/https?:\/\/(?:www\.)?dinkdonk\.mov[^\s""'<>]*/i);
+                        if (full && full[0]) return full[0];
+                        const partial = text.match(/\bdinkdonk\.mov[^\s""'<>]*/i);
+                        if (partial && partial[0]) return partial[0].startsWith('http') ? partial[0] : ('https://' + partial[0]);
+                        return '';
+                    }
+                    function maybeAutoOpenDinkDonk(url) {
+                        if (!url || !xGet('dinkdonk.autoOpenPoll', true)) return;
+                        const now = Date.now();
+                        if (ddLastAutoOpenUrl === url && (now - ddLastAutoOpenAt) < 15000) return;
+                        ddLastAutoOpenUrl = url;
+                        ddLastAutoOpenAt = now;
+                        try {
+                            window.open(url, '_blank', 'noopener,noreferrer');
+                        } catch (error) {
+                        }
+                    }
+                    function setDinkDonkActiveUrl(url) {
+                        const btn = document.getElementById('codex-dinkdonk-btn');
+                        if (!btn) return;
+                        btn.href = url;
+                        btn.style.color = 'yellow';
+                        const svg = btn.querySelector('svg');
+                        if (svg) svg.style.stroke = 'yellow';
+                        clearTimeout(ddTimer);
+                        ddTimer = setTimeout(() => {
+                            ddTimer = null;
+                            btn.href = 'https://dinkdonk.mov';
+                            btn.style.color = '';
+                            const s = btn.querySelector('svg'); if (s) s.style.stroke = '#555';
+                        }, 4 * 60 * 1000);
+                    }
+                    function handleDinkDonkAnnouncement(nick, text) {
+                        const pollUrl = extractDinkDonkUrl(text);
+                        if (!isDinkDonkAnnouncer(nick) || !pollUrl) return;
+                        setDinkDonkActiveUrl(pollUrl);
+                        maybeAutoOpenDinkDonk(pollUrl);
+                    }
                     function buildDinkDonkBtn() {
                         if (document.getElementById('codex-dinkdonk-btn')) return;
                         const ref = document.getElementById('chat-whisper-btn');
@@ -3283,26 +4158,40 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     }
                     onWsMsg(data => {
                         if (!xGet('dinkdonk.enabled', true)) return;
-                        if (!data.startsWith('BROADCAST ')) return;
                         try {
-                            const p = JSON.parse(data.slice(10));
-                            if (p.nick === 'DinkDonkBot' && typeof p.data === 'string' && p.data.includes('dinkdonk.mov')) {
-                                const btn = document.getElementById('codex-dinkdonk-btn');
-                                if (!btn) return;
-                                btn.href = p.data;
-                                btn.style.color = 'yellow';
-                                const svg = btn.querySelector('svg');
-                                if (svg) svg.style.stroke = 'yellow';
-                                clearTimeout(ddTimer);
-                                ddTimer = setTimeout(() => {
-                                    ddTimer = null;
-                                    btn.href = 'https://dinkdonk.mov';
-                                    btn.style.color = '';
-                                    const s = btn.querySelector('svg'); if (s) s.style.stroke = '#555';
-                                }, 4 * 60 * 1000);
-                            }
+                            const splitIndex = data.indexOf(' ');
+                            if (splitIndex <= 0) return;
+                            const payload = data.slice(splitIndex + 1);
+                            if (!payload || payload[0] !== '{') return;
+                            const p = JSON.parse(payload);
+                            if (!p) return;
+                            const nick = p.nick || p.username || p.user || '';
+                            const text = typeof p.data === 'string' ? p.data : (typeof p.message === 'string' ? p.message : '');
+                            handleDinkDonkAnnouncement(nick, text);
                         } catch {}
                     });
+                    function watchDinkDonkChatLines() {
+                        const lines = document.querySelector('.chat-lines');
+                        if (!lines || lines.dataset.codexDinkDonkWatchBound) return;
+                        lines.dataset.codexDinkDonkWatchBound = '1';
+                        new MutationObserver(muts => {
+                            if (!xGet('dinkdonk.enabled', true)) return;
+                            for (const m of muts) {
+                                for (const n of m.addedNodes) {
+                                    if (!(n instanceof Element)) continue;
+                                    const row = n.classList.contains('msg-user') || n.classList.contains('msg-chat')
+                                        ? n
+                                        : n.querySelector('.msg-user, .msg-chat');
+                                    if (!(row instanceof Element)) continue;
+                                    const nick = row.getAttribute('data-username')
+                                        || row.querySelector('.user, .chat-user')?.textContent
+                                        || '';
+                                    const text = row.querySelector('.text')?.textContent || row.textContent || '';
+                                    handleDinkDonkAnnouncement(String(nick).trim(), String(text).trim());
+                                }
+                            }
+                        }).observe(lines, { childList: true, subtree: true });
+                    }
 
                     // ── Feature 4: External chat side panel (Kick / YouTube) ──────
                     function getSplitChatApi() {
@@ -3333,7 +4222,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             }
                         }, 0);
 
-                        return document.getElementById('codex-dual-stream-chat-btn');
+                        return document.getElementById('codex-stream-chat-btn');
                     }
 
                     const EXT_PANEL = 'codex-ext-panel';
@@ -3348,7 +4237,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     function openExtPanel() {
                         let panel = document.getElementById(EXT_PANEL);
                         const src = extSrc(xGet('externalChat.url', ''));
-                        if (!src) return;
+                        if (!src) return false;
                         if (!panel) {
                             const w = Math.max(PANEL_MIN, Math.min(PANEL_MAX, xGet('externalChat.width', 340)));
                             panel = document.createElement('div');
@@ -3391,6 +4280,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         }
                         xSet('externalChat.open', true);
                         syncExtBtn(true);
+                        return true;
                     }
                     function closeExtPanel() {
                         const p = document.getElementById(EXT_PANEL);
@@ -3414,12 +4304,36 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         btn.setAttribute('role', 'button');
                         btn.title = 'External Chat Panel';
                         btn.setAttribute('data-tippy-content', 'External Chat Panel');
-                        btn.innerHTML = `<i class=""btn-icon"" style=""background-repeat:no-repeat;background-position:center;background-size:90% 90%;background-image:url(&quot;data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect x='2' y='3' width='9' height='18' rx='1.5' fill='none' stroke='white' stroke-width='1.75'/><rect x='13' y='3' width='9' height='18' rx='1.5' fill='none' stroke='white' stroke-width='1.75'/><line x1='7.5' y1='7' x2='7.5' y2='17' stroke='white' stroke-width='1.25' stroke-linecap='round'/><line x1='17.5' y1='7' x2='17.5' y2='17' stroke='white' stroke-width='1.25' stroke-linecap='round'/></svg>&quot;)""></i>`;
+                        btn.innerHTML = `<i class=""btn-icon"" style=""opacity:1;background-repeat:no-repeat;background-position:center;background-size:90% 90%;background-image:url(&quot;data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect x='2' y='3' width='9' height='18' rx='1.5' fill='none' stroke='white' stroke-width='1.75'/><rect x='13' y='3' width='9' height='18' rx='1.5' fill='none' stroke='white' stroke-width='1.75'/><line x1='7.5' y1='7' x2='7.5' y2='17' stroke='white' stroke-width='1.25' stroke-linecap='round'/><line x1='17.5' y1='7' x2='17.5' y2='17' stroke='white' stroke-width='1.25' stroke-linecap='round'/></svg>&quot;)""></i>`;
                         btn.addEventListener('click', e => {
                             e.preventDefault(); e.stopPropagation();
                             const p = document.getElementById(EXT_PANEL);
                             if (p && p.style.display !== 'none') closeExtPanel();
-                            else openExtPanel();
+                            else {
+                                const opened = openExtPanel();
+                                if (!opened) {
+                                    buildSettings();
+                                    const settingsPanel = document.getElementById(SETT_ID);
+                                    if (settingsPanel) {
+                                        settingsPanel.classList.add('active');
+                                    }
+                                    const settingsBtn = document.getElementById('codex-ext-settings-btn');
+                                    if (settingsBtn) {
+                                        settingsBtn.classList.add('codex-split-chat-active');
+                                    }
+                                    const urlInput = settingsPanel
+                                        ? settingsPanel.querySelector('input[placeholder*=""#kick/username""]')
+                                        : null;
+                                    if (urlInput && typeof urlInput.focus === 'function') {
+                                        urlInput.focus();
+                                        if (typeof urlInput.select === 'function') {
+                                            urlInput.select();
+                                        }
+                                    }
+                                    btn.style.outline = '2px solid orange';
+                                    btn.title = 'Set external chat URL first';
+                                }
+                            }
                         });
                         ref.parentElement.insertBefore(btn, ref);
                     }
@@ -3558,9 +4472,9 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             #${SETT_ID} textarea.xs-ta { width:100%; background:#0e0e12; border:1px solid #2a2a2a; color:#ccc; border-radius:3px; padding:4px 6px; font-size:11px; resize:vertical; min-height:52px; box-sizing:border-box; font-family:inherit; }
                             #${SETT_ID} textarea.xs-ta:focus { outline:none; border-color:#444; }
                             #codex-ext-settings-btn.codex-split-chat-active { opacity:1 !important; }
-                            #codex-ext-settings-btn .btn-icon { opacity:.5; transition:opacity .15s; }
-                            #codex-ext-settings-btn:hover .btn-icon,
-                            #codex-ext-settings-btn.codex-split-chat-active .btn-icon { opacity:1; }
+                            #codex-ext-settings-btn .btn-icon,
+                            #codex-ext-panel-btn .btn-icon,
+                            #codex-snip-btn .btn-icon { opacity:1 !important; }
                         `;
                         (document.head || document.documentElement).appendChild(s);
                     }
@@ -3614,16 +4528,30 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         wta.value = getWatched().join('\n');
                         wta.addEventListener('input', () => setWatched(wta.value.split('\n').map(s => s.trim()).filter(Boolean)));
                         wRow.appendChild(wta); body.appendChild(wRow);
-
-                        // ── Activity Alerts ──
-                        body.appendChild(mkSection('🔔 Activity Alerts'));
-                        body.appendChild(mkCheckRow('Show inline join/quit/embed alerts', 'activity.enabled', true));
-                        body.appendChild(mkCheckRow('Alert on JOIN', 'activity.join', true));
-                        body.appendChild(mkCheckRow('Alert on QUIT', 'activity.quit', true));
-                        body.appendChild(mkCheckRow('Alert on embed update', 'activity.embed', true));
+                        body.appendChild(mkCheckRow('Show inline join/quit/embed alerts for watched users', 'activity.enabled', true));
+                        body.appendChild(mkCheckRow('Alert on JOIN (watched users)', 'activity.join', true));
+                        body.appendChild(mkCheckRow('Alert on QUIT (watched users)', 'activity.quit', true));
+                        body.appendChild(mkCheckRow('Alert on embed update (watched users)', 'activity.embed', true));
                         body.appendChild(mkCheckRow('Desktop notification when watched user messages', 'notifications.enabled', false, on => {
                             if (on && typeof Notification !== 'undefined' && Notification.permission === 'default') Notification.requestPermission();
                         }));
+
+                        // ── Activity Alerts ──
+                        body.appendChild(mkSection('🔔 Activity Alerts'));
+                        body.appendChild(mkCheckRow('Play ding when your username is mentioned', 'mentions.ding.enabled', true));
+                        const mentionRow = document.createElement('div'); mentionRow.className = 'xs-row';
+                        const mentionLabel = document.createElement('label');
+                        mentionLabel.textContent = 'Mention username override:';
+                        mentionLabel.style.flex = '0 0 auto';
+                        mentionLabel.style.color = '#888';
+                        const mentionInput = document.createElement('input');
+                        mentionInput.type = 'text';
+                        mentionInput.placeholder = '(optional, leave blank to auto-detect)';
+                        mentionInput.value = xGet('mentions.username', '');
+                        mentionInput.addEventListener('input', () => xSet('mentions.username', mentionInput.value.trim()));
+                        mentionRow.appendChild(mentionLabel);
+                        mentionRow.appendChild(mentionInput);
+                        body.appendChild(mentionRow);
 
                         // ── DinkDonk ──
                         body.appendChild(mkSection('🎬 DinkDonk'));
@@ -3631,22 +4559,23 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             const b = document.getElementById('codex-dinkdonk-btn');
                             if (b) b.style.display = on ? '' : 'none';
                         }));
+                        body.appendChild(mkCheckRow('Auto-open poll links from DinkDonk_bot', 'dinkdonk.autoOpenPoll', true));
 
-                        // ── External Chat Panel ──
-                        body.appendChild(mkSection('💬 External Chat Panel'));
-                        const urlRow = document.createElement('div'); urlRow.className = 'xs-row';
-                        const urlLabel = document.createElement('label');
-                        urlLabel.textContent = 'URL:'; urlLabel.style.flex = '0 0 auto'; urlLabel.style.color = '#888';
-                        const urlIn = document.createElement('input');
-                        urlIn.type = 'text'; urlIn.placeholder = '#kick/username  or  #youtube/VIDEO_ID';
-                        urlIn.value = xGet('externalChat.url', '');
-                        urlIn.addEventListener('input', () => {
-                            xSet('externalChat.url', urlIn.value.trim());
-                            const iframe = document.querySelector('#' + EXT_PANEL + ' iframe');
-                            if (iframe) { const src = extSrc(urlIn.value); if (src) iframe.src = src; }
-                        });
-                        urlRow.appendChild(urlLabel); urlRow.appendChild(urlIn);
-                        body.appendChild(urlRow);
+                        body.appendChild(mkSection('External Chat'));
+                        const extChatRow = document.createElement('div');
+                        extChatRow.className = 'xs-row';
+                        const extChatLabel = document.createElement('label');
+                        extChatLabel.textContent = 'Panel URL:';
+                        extChatLabel.style.flex = '0 0 auto';
+                        extChatLabel.style.color = '#888';
+                        const extChatInput = document.createElement('input');
+                        extChatInput.type = 'text';
+                        extChatInput.placeholder = '#kick/username, #youtube/video-id, or https://...';
+                        extChatInput.value = xGet('externalChat.url', '');
+                        extChatInput.addEventListener('input', () => xSet('externalChat.url', extChatInput.value.trim()));
+                        extChatRow.appendChild(extChatLabel);
+                        extChatRow.appendChild(extChatInput);
+                        body.appendChild(extChatRow);
 
                         // ── Chat Input ──
                         body.appendChild(mkSection('✏️ Chat Input'));
@@ -3698,9 +4627,83 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     }
 
                     // ── Snip button (scissors → ms-screenclip → femboy.beauty) ──────
+                    function tryPostSnipStart(payload) {
+                        let sent = false;
+                        const host = window.chrome && window.chrome.webview;
+                        if (host && typeof host.postMessage === 'function') {
+                            try {
+                                host.postMessage(payload);
+                                sent = true;
+                            } catch (error) {
+                            }
+                        }
+
+                        const topWin = window.top;
+                        if (topWin && topWin !== window) {
+                            try {
+                                const topHost = topWin.chrome && topWin.chrome.webview;
+                                if (topHost && typeof topHost.postMessage === 'function') {
+                                    topHost.postMessage(payload);
+                                    sent = true;
+                                }
+                            } catch (error) {
+                            }
+                        }
+
+                        if (topWin && topWin !== window && typeof topWin.postMessage === 'function') {
+                            try {
+                                topWin.postMessage(payload, '*');
+                                sent = true;
+                            } catch (error) {
+                            }
+                        }
+
+                        return sent;
+                    }
+
+                    window.__codexSendSnipProbe = function() {
+                        const payload = { type: 'codex-snip-start', requestId: String(Date.now()), probe: true };
+                        const sent = tryPostSnipStart(payload);
+                        postSnipDebug('probe-send', { sent: sent });
+                        return sent;
+                    };
+
+                    function postSnipDebug(stage, extra) {
+                        const data = extra || {};
+                        data.type = 'codex-snip-debug';
+                        data.stage = stage;
+                        data.href = (() => { try { return String(window.location.href || ''); } catch (e) { return ''; } })();
+                        data.inIframe = (() => { try { return window.top !== window; } catch (e) { return true; } })();
+                        data.hasHost = !!(window.chrome && window.chrome.webview && typeof window.chrome.webview.postMessage === 'function');
+                        data.hasTopHost = (() => {
+                            try {
+                                return !!(window.top && window.top.chrome && window.top.chrome.webview && typeof window.top.chrome.webview.postMessage === 'function');
+                            } catch (error) {
+                                return false;
+                            }
+                        })();
+                        const host = window.chrome && window.chrome.webview;
+                        if (host && typeof host.postMessage === 'function') {
+                            try {
+                                host.postMessage(data);
+                                return true;
+                            } catch (error) {
+                            }
+                        }
+                        const topWin = window.top;
+                        if (topWin && topWin !== window && typeof topWin.postMessage === 'function') {
+                            try {
+                                topWin.postMessage(data, '*');
+                                return true;
+                            } catch (error) {
+                            }
+                        }
+                        return false;
+                    }
+
                     function buildSnipBtn() {
                         if (document.getElementById('codex-snip-btn')) return;
-                        const ref = document.getElementById('codex-ext-panel-btn')
+                        const ref = document.getElementById('codex-ext-settings-btn')
                             || document.getElementById('chat-settings-btn');
                         if (!ref || !ref.parentElement) return;
                         const btn = document.createElement('a');
@@ -3709,7 +4712,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         btn.setAttribute('role', 'button');
                         btn.title = 'Snip & upload';
                         btn.setAttribute('data-tippy-content', 'Snip & upload to femboy.beauty');
-                        btn.innerHTML = `<i class=""btn-icon"" style=""font-style:normal;font-size:16px;line-height:1;display:flex;align-items:center;justify-content:center;"">✂</i>`;
+                        btn.innerHTML = `<i class=""btn-icon"" style=""opacity:1;font-style:normal;font-size:16px;line-height:1;display:flex;align-items:center;justify-content:center;"">✂</i>`;
                         btn.addEventListener('click', e => {
                             e.preventDefault(); e.stopPropagation();
                             // Debug: immediately turn orange so we know click fired
@@ -3718,45 +4721,135 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             if (!host) {
                                 btn.style.outline = '2px solid red';
                                 btn.title = 'ERR: no webview host';
-                                return;
                             }
                             btn.title = 'Snipping…';
                             btn.classList.add('codex-split-chat-active');
-                            host.postMessage({ type: 'codex-snip-start' });
+                            postSnipDebug('click-before-send', {});
+                            const payload = { type: 'codex-snip-start', requestId: String(Date.now()) };
+                            const sent = tryPostSnipStart(payload);
+                            window.__codexLastSnipSendTs = Date.now();
+                            window.__codexLastSnipSent = !!sent;
+                            postSnipDebug('click-after-send', { sent: sent });
+                            if (!sent) {
+                                btn.style.outline = '2px solid red';
+                                btn.title = 'ERR: snip message failed';
+                            }
                         });
                         ref.parentElement.insertBefore(btn, ref);
+                    }
+
+                    if (!window.__codexSnipRelayBound) {
+                        window.__codexSnipRelayBound = true;
+                        window.addEventListener('message', event => {
+                            const data = event && event.data;
+                            if (!data || typeof data !== 'object') {
+                                return;
+                            }
+
+                            if (data.type === 'codex-snip-debug') {
+                                const hostForDebug = window.chrome && window.chrome.webview;
+                                if (hostForDebug && typeof hostForDebug.postMessage === 'function') {
+                                    try {
+                                        hostForDebug.postMessage(data);
+                                    } catch (error) {
+                                    }
+                                }
+                                return;
+                            }
+
+                            if (data.type !== 'codex-snip-start') {
+                                return;
+                            }
+
+                            const host = window.chrome && window.chrome.webview;
+                            if (!host || typeof host.postMessage !== 'function') {
+                                return;
+                            }
+
+                            try {
+                                host.postMessage({
+                                    type: 'codex-snip-start',
+                                    requestId: data.requestId ? String(data.requestId) : String(Date.now()),
+                                    relayed: true
+                                });
+                                postSnipDebug('relay-posted', { sent: true });
+                            } catch (error) {
+                                postSnipDebug('relay-failed', { sent: false, error: error && error.message ? String(error.message) : 'relay-error' });
+                            }
+                        });
                     }
 
                     // ── Receive snip URL back from C# ────────────────────────────
                     if (!window.__codexSnipListenerAdded) {
                         window.__codexSnipListenerAdded = true;
+                        window.__codexLastSnipDoneSignature = window.__codexLastSnipDoneSignature || '';
+                        window.__codexLastSnipDoneAt = window.__codexLastSnipDoneAt || 0;
+                        const applySnipDone = (msg) => {
+                            if (!msg || msg.type !== 'codex-snip-done') return;
+                            const signature = String(msg.url || '') + '|' + String(msg.error || '');
+                            const now = Date.now();
+                            if (window.__codexLastSnipDoneSignature === signature && (now - window.__codexLastSnipDoneAt) < 2500) {
+                                postSnipDebug('done-duplicate-ignored', { hasUrl: !!msg.url });
+                                return;
+                            }
+                            window.__codexLastSnipDoneSignature = signature;
+                            window.__codexLastSnipDoneAt = now;
+                            const btn = document.getElementById('codex-snip-btn');
+                            if (btn) {
+                                btn.style.outline = '2px solid cyan';
+                                btn.classList.remove('codex-split-chat-active');
+                                btn.title = msg.url ? 'Snip & upload' : ('ERR: ' + (msg.error || 'unknown'));
+                            }
+                            const findInputTarget = () => {
+                                const direct = document.querySelector('#chat-input-control, #chat-input-wrap textarea, #chat-input-frame textarea');
+                                if (direct) {
+                                    return { input: direct, context: 'main' };
+                                }
+                                return { input: null, context: 'none' };
+                            };
+                            if (!msg.url) {
+                                const target = findInputTarget();
+                                if (target.input) target.input.value = '[snip error: ' + (msg.error || 'unknown') + ']';
+                                postSnipDebug('done-error', { target: target.context, error: msg.error || 'unknown' });
+                                return;
+                            }
+                            const target = findInputTarget();
+                            const ta = target.input;
+                            if (!ta) {
+                                postSnipDebug('done-no-input-target', { target: target.context });
+                                return;
+                            }
+                            const s = ta.selectionStart != null ? ta.selectionStart : ta.value.length;
+                            const en = ta.selectionEnd != null ? ta.selectionEnd : ta.value.length;
+                            const prefix = (s > 0 && ta.value[s - 1] !== ' ') ? ' ' : '';
+                            ta.value = ta.value.slice(0, s) + prefix + msg.url + ' ' + ta.value.slice(en);
+                            ta.selectionStart = ta.selectionEnd = s + prefix.length + msg.url.length + 1;
+                            ta.dispatchEvent(new Event('input', { bubbles: true }));
+                            ta.focus();
+                            postSnipDebug('done-inserted', { target: target.context, hasUrl: true });
+                        };
                         const host = window.chrome && window.chrome.webview;
                         if (host) {
                             host.addEventListener('message', e => {
                                 let msg;
                                 try { msg = typeof e.data === 'string' ? JSON.parse(e.data) : e.data; } catch { return; }
-                                if (!msg || msg.type !== 'codex-snip-done') return;
-                                const btn = document.getElementById('codex-snip-btn');
-                                if (btn) {
-                                    btn.style.outline = '2px solid cyan';
-                                    btn.classList.remove('codex-split-chat-active');
-                                    btn.title = msg.url ? 'Snip & upload' : ('ERR: ' + (msg.error || 'unknown'));
-                                }
-                                if (!msg.url) {
-                                    // Show error in chat input for debugging
-                                    const ta = document.querySelector('#chat-input-control');
-                                    if (ta) ta.value = '[snip error: ' + (msg.error || 'unknown') + ']';
+                                if (msg && msg.type === 'codex-snip-ack') {
+                                    const btn = document.getElementById('codex-snip-btn');
+                                    if (btn) {
+                                        btn.style.outline = '2px solid lime';
+                                        btn.title = 'Snip acknowledged';
+                                    }
                                     return;
                                 }
-                                const ta = document.querySelector('#chat-input-control');
-                                if (!ta) return;
-                                const s = ta.selectionStart != null ? ta.selectionStart : ta.value.length;
-                                const en = ta.selectionEnd != null ? ta.selectionEnd : ta.value.length;
-                                const prefix = (s > 0 && ta.value[s - 1] !== ' ') ? ' ' : '';
-                                ta.value = ta.value.slice(0, s) + prefix + msg.url + ' ' + ta.value.slice(en);
-                                ta.selectionStart = ta.selectionEnd = s + prefix.length + msg.url.length + 1;
-                                ta.dispatchEvent(new Event('input', { bubbles: true }));
-                                ta.focus();
+                                applySnipDone(msg);
+                            });
+                        }
+                        if (!window.__codexSnipWindowMessageBound) {
+                            window.__codexSnipWindowMessageBound = true;
+                            window.addEventListener('message', e => {
+                                const msg = e && e.data;
+                                if (!msg || msg.type !== 'codex-snip-done') return;
+                                applySnipDone(msg);
                             });
                         }
                     }
@@ -3771,7 +4864,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         btn.setAttribute('role', 'button');
                         btn.title = 'Chat Extensions';
                         btn.setAttribute('data-tippy-content', 'Chat Extensions');
-                        btn.innerHTML = `<i class=""btn-icon"" style=""font-style:normal;font-size:15px;display:flex;align-items:center;justify-content:center;"">⚙</i>`;
+                        btn.innerHTML = `<i class=""btn-icon"" style=""opacity:1;font-style:normal;font-size:15px;display:flex;align-items:center;justify-content:center;"">⚙</i>`;
                         btn.addEventListener('click', e => {
                             e.preventDefault(); e.stopPropagation();
                             buildSettings();
@@ -3791,8 +4884,8 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         ensureSettingsStyles();
                         ensureDualChatMessageBridge();
                         buildSettingsBtn();
-                        buildDinkDonkBtn();
                         buildExtPanelBtn();
+                        buildDinkDonkBtn();
                         buildSnipBtn();
                         buildDualChatBtn();
                         requestDualChatSource();
@@ -3800,9 +4893,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         setupHiddenPhrases();
                         setupImageUpload();
                         watchMsgNotify();
-                        if (xGet('externalChat.open', false) && xGet('externalChat.url', '')) {
-                            window.setTimeout(openExtPanel, 500);
-                        }
+                        watchDinkDonkChatLines();
                         const ddBtn = document.getElementById('codex-dinkdonk-btn');
                         if (ddBtn && !xGet('dinkdonk.enabled', true)) ddBtn.style.display = 'none';
                         return true;
@@ -3841,15 +4932,35 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             UpdateAddressBox(e.Uri);
             UpdateBigscreenBarVisibility();
 
+            Uri targetUri;
+            if (TryBuildUri(e.Uri, out targetUri) && IsAllowedUri(targetUri) && ShouldResetChatLayoutForNavigation(targetUri))
+            {
+                ResetChatLayoutForModeSwitch();
+            }
+
             if (string.IsNullOrWhiteSpace(e.Uri) || e.Uri.IndexOf("/embed/chat", StringComparison.OrdinalIgnoreCase) < 0)
             {
                 _dualChatInputTop = 0;
+                _dualChatPaneLeft = 0;
+                _dualChatPaneTop = 0;
+                _dualChatPaneWidth = 0;
+                _dualChatPaneHeight = 0;
+                _dualChatLayoutActive = false;
+                _lastDualChatLayoutFingerprint = null;
+                _embedChatLayoutViewportWidth = 0;
+                _embedChatLayoutViewportHeight = 0;
                 LayoutDualChatPanel();
             }
 
-            if (string.IsNullOrWhiteSpace(e.Uri) || e.Uri.IndexOf("/bigscreen", StringComparison.OrdinalIgnoreCase) < 0)
+            bool navigatingToBigscreen = !string.IsNullOrWhiteSpace(e.Uri) && e.Uri.IndexOf("/bigscreen", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (!navigatingToBigscreen && !IsBigscreenHostMode())
             {
                 _bigscreenChatTopOffset = 0;
+                _bigscreenViewportWidth = 0;
+                _bigscreenViewportHeight = 0;
+                _lastSnipRequestId = string.Empty;
+                _lastSnipRequestUtc = DateTime.MinValue;
+                _treatSnipAsProbe = false;
             }
         }
 
@@ -3859,12 +4970,48 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             {
                 SetStatus("Ready.");
                 PersistBrowserSession();
+                _lastStreamChatSourceJson = null;
+                _lastDualChatLayoutFingerprint = null;
+                _activeStreamPlayerUrl = null;
+
+                if (_runStreamChatPanelSelfTest && !_streamChatPanelSelfTestStarted)
+                {
+                    _streamChatPanelSelfTestStarted = true;
+                    _suppressPageEmbedsState = true;
+                    _pendingSplitSelfTestTask = RunStreamChatPanelSelfTestAsync();
+                }
+
                 NotifyDualChatSourceChanged();
+                ApplyBigscreenExternalChatLayout(_dualChatHostEnabled && IsBigscreenPage());
 
                 if (_runSplitSelfTest && !_splitSelfTestStarted)
                 {
                     _splitSelfTestStarted = true;
                     _pendingSplitSelfTestTask = RunSplitSelfTestAsync();
+                }
+
+                if (_runPopoutPauseSelfTest && !_popoutPauseSelfTestStarted)
+                {
+                    _popoutPauseSelfTestStarted = true;
+                    _pendingSplitSelfTestTask = RunPopoutPauseSelfTestAsync();
+                }
+
+                if (_runToolbarSelfTest && !_toolbarSelfTestStarted)
+                {
+                    _toolbarSelfTestStarted = true;
+                    _pendingSplitSelfTestTask = RunToolbarSelfTestAsync();
+                }
+
+                if (_runDualSelfTest && !_dualSelfTestStarted)
+                {
+                    _dualSelfTestStarted = true;
+                    _pendingSplitSelfTestTask = RunDualSelfTestAsync();
+                }
+
+                if (_runBigscreenGeometrySelfTest && !_bigscreenGeometrySelfTestStarted)
+                {
+                    _bigscreenGeometrySelfTestStarted = true;
+                    _pendingSplitSelfTestTask = RunBigscreenGeometrySelfTestAsync();
                 }
             }
             else
@@ -3884,6 +5031,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 UpdateAddressBox(_webView.Source.AbsoluteUri);
             }
 
+            ApplyBigscreenExternalChatLayout(_dualChatHostEnabled && IsBigscreenPage());
             UpdateBigscreenBarVisibility();
             LayoutDualChatPanel();
         }
@@ -3896,7 +5044,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 return false;
             }
 
-            return currentUri.AbsoluteUri.IndexOf("/embed/chat", StringComparison.OrdinalIgnoreCase) >= 0;
+            return IsChatUri(currentUri);
         }
 
         private bool IsBigscreenPage()
@@ -3907,7 +5055,24 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 return false;
             }
 
-            return currentUri.AbsoluteUri.IndexOf("/bigscreen", StringComparison.OrdinalIgnoreCase) >= 0;
+            return IsBigscreenUri(currentUri);
+        }
+
+        private bool IsBigscreenHostMode()
+        {
+            return IsBigscreenPage() || (_bigscreenBarPanel != null && _bigscreenBarPanel.Visible);
+        }
+
+        private static bool IsChatUri(Uri uri)
+        {
+            return uri != null &&
+                uri.AbsolutePath.StartsWith("/embed/chat", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsBigscreenUri(Uri uri)
+        {
+            return uri != null &&
+                uri.AbsolutePath.StartsWith("/bigscreen", StringComparison.OrdinalIgnoreCase);
         }
 
         private async System.Threading.Tasks.Task RunSplitSelfTestAsync()
@@ -3958,7 +5123,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                                 hasWatchingButton: !!document.getElementById('chat-watching-focus-btn'),
                                 hasSettingsButton: !!document.getElementById('chat-settings-btn'),
                                 hasSnipButton: !!document.getElementById('codex-snip-btn'),
-                                hasDualButton: !!document.getElementById('codex-dual-stream-chat-btn')
+                                hasDualButton: !!document.getElementById('codex-stream-chat-btn')
                             });
                         }
 
@@ -3986,6 +5151,13 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
                         const hoverUnderline = window.getComputedStyle(overlayUser).textDecorationLine;
                         const hoverInlineStyle = overlayUser.style.textDecoration || '';
+                        let splitFocusClearWorked = false;
+                        let notifyResetWorked = false;
+                        let notifyFound = false;
+                        let notifyUnpinnedBefore = false;
+                        let notifyUnpinnedAfter = false;
+                        let notifyHandlerRan = false;
+                        let notifyScrollOffsetAfter = 0;
 
                         overlayUser.dispatchEvent(new MouseEvent('click', {
                             bubbles: true,
@@ -4009,6 +5181,22 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             const opacity = parseFloat(window.getComputedStyle(message).opacity || '1');
                             return opacity > 0.9;
                         }).length;
+
+                        overlayUser.dispatchEvent(new MouseEvent('click', {
+                            bubbles: true,
+                            cancelable: true,
+                            composed: true,
+                            button: 0,
+                            buttons: 1,
+                            detail: 1,
+                            clientX: 24,
+                            clientY: 24
+                        }));
+                        await wait(250);
+                        {
+                            const overlayEl = document.getElementById('codex-split-chat-overlay');
+                            splitFocusClearWorked = !(overlayEl && overlayEl.classList.contains('codex-split-chat-focus'));
+                        }
 
                         overlayUser.dispatchEvent(new MouseEvent('contextmenu', {
                             bubbles: true,
@@ -4090,8 +5278,34 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         let scrollHoldWorked = false;
                         let scrollAnchorBefore = '';
                         let scrollAnchorAfter = '';
+                        let extSettingsButtonFound = false;
+                        let extSettingsOpenWorked = false;
+                        let extSettingsCloseWorked = false;
+                        let extSettingsPersistWorked = false;
+                        let watchedUsersPersistWorked = false;
+                        let activityTogglesWorked = false;
+                        let activityFunctionWorked = false;
+                        let notificationsFunctionWorked = false;
+                        let dinkDonkTogglesWorked = false;
+                        let dinkDonkButtonToggleWorked = false;
+                        let dinkDonkAutoOpenFunctionWorked = false;
+                        let externalChatUrlPersistWorked = false;
+                        let externalChatPanelFunctionWorked = false;
+                        let chatInputDoubleClickToggleWorked = false;
+                        let chatInputDoubleClickFunctionWorked = false;
+                        let phraseHighlightsToggleWorked = false;
+                        let phraseAddButtonFound = false;
+                        let phraseAddFunctionWorked = false;
+                        let phraseHighlightFunctionWorked = false;
+                        let hiddenPhrasesToggleWorked = false;
+                        let hiddenPhrasesPersistWorked = false;
+                        let hiddenPhrasesFunctionWorked = false;
+                        let imageUploadToggleWorked = false;
+                        let imageUploadFunctionWorked = false;
+                        let snipButtonFound = false;
+                        let snipActivateWorked = false;
 
-                        const dualButton = await waitFor(() => document.getElementById('codex-dual-stream-chat-btn'), 5000);
+                        const dualButton = await waitFor(() => document.getElementById('codex-stream-chat-btn'), 5000);
                         dualChatButtonFound = !!dualButton;
                         if (dualButton) {
                             document.dispatchEvent(new CustomEvent('codex:dualchat-source', {
@@ -4229,7 +5443,11 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             }
 
                             const notify = document.querySelector('#codex-split-chat-overlay .codex-split-chat-notify');
+                            notifyFound = !!notify;
                             if (notify) {
+                                const overlayBeforeNotify = document.getElementById('codex-split-chat-overlay');
+                                notifyUnpinnedBefore = !!(overlayBeforeNotify && overlayBeforeNotify.classList.contains('codex-split-chat-unpinned'));
+                                const notifyStampBefore = overlayBeforeNotify?.getAttribute('data-codex-notify-click-ts') || '';
                                 notify.dispatchEvent(new MouseEvent('click', {
                                     bubbles: true,
                                     cancelable: true,
@@ -4241,11 +5459,586 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                                     clientY: 30
                                 }));
                                 await wait(250);
+                                const overlayEl = document.getElementById('codex-split-chat-overlay');
+                                notifyUnpinnedAfter = !!(overlayEl && overlayEl.classList.contains('codex-split-chat-unpinned'));
+                                const notifyStampAfter = overlayEl?.getAttribute('data-codex-notify-click-ts') || '';
+                                notifyHandlerRan = !!notifyStampAfter && notifyStampAfter !== notifyStampBefore;
+                                notifyResetWorked = !notifyUnpinnedAfter;
                             }
                         }
 
+                        const extSettingsBtn = await waitFor(() => document.getElementById('codex-ext-settings-btn'), 5000);
+                        extSettingsButtonFound = !!extSettingsBtn;
+                        if (extSettingsBtn) {
+                            extSettingsBtn.dispatchEvent(new MouseEvent('click', {
+                                bubbles: true,
+                                cancelable: true,
+                                composed: true,
+                                button: 0,
+                                buttons: 1,
+                                detail: 1,
+                                clientX: 16,
+                                clientY: 16
+                            }));
+                            await wait(220);
+
+                            const extPanel = document.getElementById('codex-ext-settings');
+                            extSettingsOpenWorked = !!(extPanel &&
+                                extPanel.classList.contains('active') &&
+                                extSettingsBtn.classList.contains('codex-split-chat-active'));
+
+                            const notificationsCheckbox = extPanel
+                                ? extPanel.querySelector('#xs-cb-notifications-enabled')
+                                : null;
+                            if (notificationsCheckbox instanceof HTMLInputElement) {
+                                const before = notificationsCheckbox.checked;
+                                notificationsCheckbox.click();
+                                await wait(120);
+                                let stored = null;
+                                try {
+                                    stored = JSON.parse(localStorage.getItem('codex-ext.notifications.enabled') || 'null');
+                                } catch (error) {
+                                    stored = null;
+                                }
+                                extSettingsPersistWorked = (stored === notificationsCheckbox.checked);
+                                if (notificationsCheckbox.checked !== before) {
+                                    notificationsCheckbox.click();
+                                    await wait(80);
+                                }
+                            }
+
+                            function readStored(key) {
+                                try {
+                                    return JSON.parse(localStorage.getItem('codex-ext.' + key) || 'null');
+                                } catch (error) {
+                                    return null;
+                                }
+                            }
+                            function writeStored(key, value) {
+                                try {
+                                    localStorage.setItem('codex-ext.' + key, JSON.stringify(value));
+                                } catch (error) {
+                                }
+                            }
+
+                            async function verifyToggle(id, key) {
+                                const cb = extPanel ? extPanel.querySelector('#' + id) : null;
+                                if (!(cb instanceof HTMLInputElement)) {
+                                    return false;
+                                }
+                                const before = cb.checked;
+                                cb.click();
+                                await wait(80);
+                                const storedAfterOn = readStored(key);
+                                const toggled = cb.checked !== before && storedAfterOn === cb.checked;
+                                cb.click();
+                                await wait(80);
+                                const storedAfterRestore = readStored(key);
+                                const restored = cb.checked === before && storedAfterRestore === cb.checked;
+                                return toggled && restored;
+                            }
+
+                            const watchedUsersArea = extPanel
+                                ? extPanel.querySelector('textarea.xs-ta[placeholder*=""destiny""]')
+                                : null;
+                            if (watchedUsersArea instanceof HTMLTextAreaElement) {
+                                const beforeText = watchedUsersArea.value;
+                                watchedUsersArea.value = 'destiny\ncodexselftest';
+                                watchedUsersArea.dispatchEvent(new Event('input', { bubbles: true }));
+                                await wait(80);
+                                const storedWatched = readStored('watchedUsers');
+                                const writeWorked = Array.isArray(storedWatched) &&
+                                    storedWatched.length === 2 &&
+                                    String(storedWatched[0] || '').toLowerCase() === 'destiny' &&
+                                    String(storedWatched[1] || '').toLowerCase() === 'codexselftest';
+                                watchedUsersArea.value = beforeText;
+                                watchedUsersArea.dispatchEvent(new Event('input', { bubbles: true }));
+                                await wait(80);
+                                const restoredWatched = readStored('watchedUsers');
+                                const beforeList = beforeText.split('\n').map(s => s.trim()).filter(Boolean);
+                                const restored = Array.isArray(restoredWatched) &&
+                                    restoredWatched.length === beforeList.length &&
+                                    restoredWatched.every((v, idx) => String(v || '') === String(beforeList[idx] || ''));
+                                watchedUsersPersistWorked = writeWorked && restored;
+                            }
+
+                            activityTogglesWorked =
+                                await verifyToggle('xs-cb-activity-enabled', 'activity.enabled') &&
+                                await verifyToggle('xs-cb-activity-join', 'activity.join') &&
+                                await verifyToggle('xs-cb-activity-quit', 'activity.quit') &&
+                                await verifyToggle('xs-cb-activity-embed', 'activity.embed') &&
+                                await verifyToggle('xs-cb-notifications-enabled', 'notifications.enabled');
+
+                            const dinkDonkCheckbox = extPanel ? extPanel.querySelector('#xs-cb-dinkdonk-enabled') : null;
+                            const ddButton = document.getElementById('codex-dinkdonk-btn');
+                            if (dinkDonkCheckbox instanceof HTMLInputElement && ddButton) {
+                                const beforeDisplay = window.getComputedStyle(ddButton).display;
+                                const beforeChecked = dinkDonkCheckbox.checked;
+                                dinkDonkCheckbox.click();
+                                await wait(100);
+                                const hiddenDisplay = window.getComputedStyle(ddButton).display;
+                                const hiddenWorked = hiddenDisplay === 'none';
+                                dinkDonkCheckbox.click();
+                                await wait(100);
+                                const restoredDisplay = window.getComputedStyle(ddButton).display;
+                                const restoredWorked = restoredDisplay !== 'none' && dinkDonkCheckbox.checked === beforeChecked;
+                                dinkDonkButtonToggleWorked = hiddenWorked && restoredWorked;
+                                const storedDinkDonk = readStored('dinkdonk.enabled');
+                                dinkDonkTogglesWorked = (storedDinkDonk === beforeChecked);
+                            }
+                            dinkDonkTogglesWorked = dinkDonkTogglesWorked &&
+                                await verifyToggle('xs-cb-dinkdonk-autoOpenPoll', 'dinkdonk.autoOpenPoll');
+
+                            const allInputs = extPanel ? Array.from(extPanel.querySelectorAll('input[type=""text""]')) : [];
+                            const externalUrlInput = allInputs.find((input) => {
+                                return input instanceof HTMLInputElement &&
+                                    String(input.placeholder || '').toLowerCase().indexOf('#kick/username') >= 0;
+                            });
+                            if (externalUrlInput instanceof HTMLInputElement) {
+                                const before = externalUrlInput.value;
+                                externalUrlInput.value = '#kick/codexselftest';
+                                externalUrlInput.dispatchEvent(new Event('input', { bubbles: true }));
+                                await wait(80);
+                                const stored = readStored('externalChat.url');
+                                const writeWorked = stored === '#kick/codexselftest';
+                                externalUrlInput.value = before;
+                                externalUrlInput.dispatchEvent(new Event('input', { bubbles: true }));
+                                await wait(80);
+                                const restored = readStored('externalChat.url') === before;
+                                externalChatUrlPersistWorked = writeWorked && restored;
+                            }
+
+                            chatInputDoubleClickToggleWorked = await verifyToggle('xs-cb-chatInput-doubleClick', 'chatInput.doubleClick');
+                            phraseHighlightsToggleWorked = await verifyToggle('xs-cb-phrases-enabled', 'phrases.enabled');
+                            phraseAddButtonFound = !!(extPanel && Array.from(extPanel.querySelectorAll('button')).some((buttonEl) => {
+                                return String(buttonEl.textContent || '').trim().toLowerCase() === '+ add phrase';
+                            }));
+                            hiddenPhrasesToggleWorked = await verifyToggle('xs-cb-hiddenPhrases-enabled', 'hiddenPhrases.enabled');
+
+                            const hiddenPhrasesArea = extPanel
+                                ? extPanel.querySelector('textarea.xs-ta[placeholder*=""one phrase per line""]')
+                                : null;
+                            if (hiddenPhrasesArea instanceof HTMLTextAreaElement) {
+                                const before = hiddenPhrasesArea.value;
+                                hiddenPhrasesArea.value = 'codex-hidden-alpha\ncodex-hidden-beta';
+                                hiddenPhrasesArea.dispatchEvent(new Event('input', { bubbles: true }));
+                                await wait(80);
+                                const stored = readStored('hiddenPhrases');
+                                const writeWorked = Array.isArray(stored) &&
+                                    stored.length === 2 &&
+                                    stored[0] === 'codex-hidden-alpha' &&
+                                    stored[1] === 'codex-hidden-beta';
+                                hiddenPhrasesArea.value = before;
+                                hiddenPhrasesArea.dispatchEvent(new Event('input', { bubbles: true }));
+                                await wait(80);
+                                const restored = readStored('hiddenPhrases');
+                                const beforeLines = before.split('\n').map(s => s.trim()).filter(Boolean);
+                                hiddenPhrasesPersistWorked = writeWorked &&
+                                    Array.isArray(restored) &&
+                                    restored.length === beforeLines.length &&
+                                    restored.every((v, idx) => String(v || '') === String(beforeLines[idx] || ''));
+                            }
+
+                            imageUploadToggleWorked = await verifyToggle('xs-cb-imageUpload-enabled', 'imageUpload.enabled');
+
+                            // Functional checks for extension behavior (not only persistence)
+                            const chatLines = document.querySelector('.chat-lines');
+                            if (chatLines instanceof Element && typeof window.__codexEmitWsTest === 'function') {
+                                const watchedBefore = readStored('watchedUsers');
+                                const activityEnabledBefore = readStored('activity.enabled');
+                                const activityJoinBefore = readStored('activity.join');
+                                const activityQuitBefore = readStored('activity.quit');
+                                const activityEmbedBefore = readStored('activity.embed');
+                                writeStored('watchedUsers', ['codexwatch']);
+                                writeStored('activity.enabled', true);
+                                writeStored('activity.join', true);
+                                writeStored('activity.quit', true);
+                                writeStored('activity.embed', true);
+                                const baseInfoCount = chatLines.querySelectorAll('.msg-info').length;
+                                window.__codexEmitWsTest('JOIN ' + JSON.stringify({ nick: 'codexwatch' }));
+                                window.__codexEmitWsTest('QUIT ' + JSON.stringify({ nick: 'codexwatch' }));
+                                window.__codexEmitWsTest('UPDATEUSER ' + JSON.stringify({
+                                    nick: 'codexwatch',
+                                    watching: { title: 'codex stream', platform: 'kick', channel: 'codexwatch' }
+                                }));
+                                await wait(160);
+                                const infoMessages = Array.from(chatLines.querySelectorAll('.msg-info')).slice(baseInfoCount);
+                                const infoText = infoMessages.map((n) => (n.textContent || '').toLowerCase()).join(' ');
+                                activityFunctionWorked = infoText.indexOf('codexwatch joined') >= 0 &&
+                                    infoText.indexOf('codexwatch left') >= 0 &&
+                                    infoText.indexOf('watching') >= 0;
+                                writeStored('watchedUsers', watchedBefore);
+                                writeStored('activity.enabled', activityEnabledBefore);
+                                writeStored('activity.join', activityJoinBefore);
+                                writeStored('activity.quit', activityQuitBefore);
+                                writeStored('activity.embed', activityEmbedBefore);
+                            }
+
+                            {
+                                const watchedBefore = readStored('watchedUsers');
+                                const notificationsBefore = readStored('notifications.enabled');
+                                const originalNotification = window.Notification;
+                                let notifyHit = false;
+                                try {
+                                    writeStored('watchedUsers', ['codexnotify']);
+                                    writeStored('notifications.enabled', true);
+                                    const FakeNotification = function(title, opts) {
+                                        notifyHit = !!title && !!(opts && opts.body);
+                                    };
+                                    FakeNotification.permission = 'granted';
+                                    window.Notification = FakeNotification;
+                                    const msg = document.createElement('div');
+                                    msg.className = 'msg-user';
+                                    msg.setAttribute('data-username', 'codexnotify');
+                                    msg.innerHTML = '<span class=""text"">codex notification ping</span>';
+                                    const lines = document.querySelector('.chat-lines');
+                                    if (lines) {
+                                        lines.appendChild(msg);
+                                        await wait(120);
+                                        notificationsFunctionWorked = notifyHit;
+                                        msg.remove();
+                                    }
+                                } catch (error) {
+                                    notificationsFunctionWorked = false;
+                                } finally {
+                                    window.Notification = originalNotification;
+                                    writeStored('watchedUsers', watchedBefore);
+                                    writeStored('notifications.enabled', notificationsBefore);
+                                }
+                            }
+
+                            {
+                                const autoOpenBefore = readStored('dinkdonk.autoOpenPoll');
+                                const originalOpen = window.open;
+                                let openedUrl = '';
+                                try {
+                                    writeStored('dinkdonk.autoOpenPoll', true);
+                                    window.open = function(url) { openedUrl = String(url || ''); return null; };
+                                    if (typeof window.__codexEmitWsTest === 'function') {
+                                        window.__codexEmitWsTest('BROADCAST ' + JSON.stringify({
+                                            nick: 'DinkDonk_bot',
+                                            data: 'new poll https://dinkdonk.mov/poll/codex-auto-open'
+                                        }));
+                                        await wait(120);
+                                        dinkDonkAutoOpenFunctionWorked = openedUrl.toLowerCase().indexOf('dinkdonk.mov') >= 0;
+                                    }
+                                } catch (error) {
+                                    dinkDonkAutoOpenFunctionWorked = false;
+                                } finally {
+                                    window.open = originalOpen;
+                                    writeStored('dinkdonk.autoOpenPoll', autoOpenBefore);
+                                }
+                            }
+
+                            {
+                                const extButton = document.getElementById('codex-ext-panel-btn');
+                                const extUrlBefore = readStored('externalChat.url');
+                                if (extButton) {
+                                    writeStored('externalChat.url', '#kick/pizzaw');
+                                    extButton.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: true, button: 0, buttons: 1 }));
+                                    await wait(180);
+                                    const panel = document.getElementById('codex-ext-panel');
+                                    const iframe = panel ? panel.querySelector('iframe') : null;
+                                    const openWorked = !!(panel && panel.style.display !== 'none' && iframe && String(iframe.src || '').indexOf('kick.com/popout/pizzaw/chat') >= 0);
+                                    extButton.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: true, button: 0, buttons: 1 }));
+                                    await wait(120);
+                                    const closedWorked = !!(panel && panel.style.display === 'none');
+                                    externalChatPanelFunctionWorked = openWorked && closedWorked;
+                                    writeStored('externalChat.url', extUrlBefore);
+                                }
+                            }
+
+                            {
+                                const ta = document.querySelector('#chat-input-control');
+                                const dcBefore = readStored('chatInput.doubleClick');
+                                if (ta instanceof HTMLTextAreaElement) {
+                                    const beforeValue = ta.value;
+                                    writeStored('chatInput.doubleClick', true);
+                                    const probeUser = document.createElement('span');
+                                    probeUser.className = 'user';
+                                    probeUser.textContent = 'CodexPing';
+                                    document.body.appendChild(probeUser);
+                                    probeUser.dispatchEvent(new MouseEvent('dblclick', {
+                                        bubbles: true,
+                                        cancelable: true,
+                                        composed: true,
+                                        button: 0,
+                                        buttons: 1,
+                                        detail: 2
+                                    }));
+                                    await wait(80);
+                                    chatInputDoubleClickFunctionWorked = ta.value.indexOf('CodexPing') >= 0;
+                                    probeUser.remove();
+                                    ta.value = beforeValue;
+                                    ta.dispatchEvent(new Event('input', { bubbles: true }));
+                                    writeStored('chatInput.doubleClick', dcBefore);
+                                }
+                            }
+
+                            {
+                                const ta = document.querySelector('#chat-input-control');
+                                const phrasesEnabledBefore = readStored('phrases.enabled');
+                                const phrasesBefore = readStored('phrases');
+                                if (ta instanceof HTMLTextAreaElement) {
+                                    const beforeValue = ta.value;
+                                    writeStored('phrases.enabled', true);
+                                    writeStored('phrases', [{ text: 'codexphrase', color: '#112233' }]);
+                                    ta.value = 'contains codexphrase trigger';
+                                    ta.dispatchEvent(new Event('input', { bubbles: true }));
+                                    await wait(80);
+                                    const bg = String(ta.style.backgroundColor || '').toLowerCase();
+                                    phraseHighlightFunctionWorked = bg.indexOf('17') >= 0 || bg.indexOf('34') >= 0 || bg.indexOf('51') >= 0 || bg.indexOf('#112233') >= 0;
+                                    const beforeCount = Array.isArray(readStored('phrases')) ? readStored('phrases').length : 0;
+                                    const addPhraseButton = extPanel
+                                        ? Array.from(extPanel.querySelectorAll('button')).find((buttonEl) => String(buttonEl.textContent || '').trim().toLowerCase() === '+ add phrase')
+                                        : null;
+                                    if (addPhraseButton) {
+                                        addPhraseButton.click();
+                                        await wait(80);
+                                        const afterCount = Array.isArray(readStored('phrases')) ? readStored('phrases').length : 0;
+                                        phraseAddFunctionWorked = afterCount === (beforeCount + 1);
+                                    }
+                                    ta.value = beforeValue;
+                                    ta.dispatchEvent(new Event('input', { bubbles: true }));
+                                    ta.style.backgroundColor = '';
+                                    writeStored('phrases.enabled', phrasesEnabledBefore);
+                                    writeStored('phrases', phrasesBefore);
+                                }
+                            }
+
+                            {
+                                const hiddenEnabledBefore = readStored('hiddenPhrases.enabled');
+                                const hiddenBefore = readStored('hiddenPhrases');
+                                const lines = document.querySelector('.chat-lines');
+                                if (lines instanceof Element) {
+                                    writeStored('hiddenPhrases.enabled', true);
+                                    writeStored('hiddenPhrases', ['codex-hidden-marker']);
+                                    const hiddenMsg = document.createElement('div');
+                                    hiddenMsg.className = 'msg-user';
+                                    hiddenMsg.innerHTML = '<span class=""text"">this has codex-hidden-marker inside</span>';
+                                    lines.appendChild(hiddenMsg);
+                                    await wait(100);
+                                    hiddenPhrasesFunctionWorked = hiddenMsg.style.display === 'none';
+                                    hiddenMsg.remove();
+                                    writeStored('hiddenPhrases.enabled', hiddenEnabledBefore);
+                                    writeStored('hiddenPhrases', hiddenBefore);
+                                }
+                            }
+
+                            {
+                                const ta = document.querySelector('#chat-input-control');
+                                const imageUploadBefore = readStored('imageUpload.enabled');
+                                const originalFetch = window.fetch;
+                                let fetchCalled = false;
+                                if (ta instanceof HTMLTextAreaElement && typeof File !== 'undefined') {
+                                    try {
+                                        writeStored('imageUpload.enabled', true);
+                                        window.fetch = async function() {
+                                            fetchCalled = true;
+                                            return {
+                                                ok: true,
+                                                json: async () => ({ link: 'https://femboy.beauty/codex-self-test' })
+                                            };
+                                        };
+                                        ta.value = '';
+                                        ta.selectionStart = 0;
+                                        ta.selectionEnd = 0;
+                                        const testFile = new File([new Blob(['codex'])], 'codex.png', { type: 'image/png' });
+                                        const pasteEvt = new Event('paste', { bubbles: true, cancelable: true });
+                                        Object.defineProperty(pasteEvt, 'clipboardData', {
+                                            value: {
+                                                items: [{
+                                                    type: 'image/png',
+                                                    getAsFile: function() { return testFile; }
+                                                }]
+                                            }
+                                        });
+                                        ta.dispatchEvent(pasteEvt);
+                                        await wait(220);
+                                        imageUploadFunctionWorked = fetchCalled && ta.value.indexOf('https://femboy.beauty/codex-self-test') >= 0;
+                                        ta.value = '';
+                                        ta.dispatchEvent(new Event('input', { bubbles: true }));
+                                    } catch (error) {
+                                        imageUploadFunctionWorked = false;
+                                    } finally {
+                                        window.fetch = originalFetch;
+                                        writeStored('imageUpload.enabled', imageUploadBefore);
+                                    }
+                                }
+                            }
+
+                            extSettingsBtn.dispatchEvent(new MouseEvent('click', {
+                                bubbles: true,
+                                cancelable: true,
+                                composed: true,
+                                button: 0,
+                                buttons: 1,
+                                detail: 1,
+                                clientX: 16,
+                                clientY: 16
+                            }));
+                            await wait(180);
+                            extSettingsCloseWorked = !!(!document.getElementById('codex-ext-settings')?.classList.contains('active') &&
+                                !extSettingsBtn.classList.contains('codex-split-chat-active'));
+                        }
+
+                        const snipButton = document.getElementById('codex-snip-btn');
+                        snipButtonFound = !!snipButton;
+                        if (snipButton) {
+                            window.__codexLastSnipSendTs = 0;
+                            window.__codexLastSnipSent = false;
+
+                            snipButton.dispatchEvent(new MouseEvent('click', {
+                                bubbles: true,
+                                cancelable: true,
+                                composed: true,
+                                button: 0,
+                                buttons: 1,
+                                detail: 1,
+                                clientX: 18,
+                                clientY: 18
+                            }));
+                            await wait(160);
+
+                            const snipTitle = (snipButton.getAttribute('title') || '').toLowerCase();
+                            const snipSent = !!window.__codexLastSnipSent;
+                            const snipSentAt = Number(window.__codexLastSnipSendTs || 0);
+                            const snipSentRecently = snipSentAt > 0;
+                            const snipUiAcknowledged = snipButton.classList.contains('codex-split-chat-active') ||
+                                snipTitle.indexOf('snipping') >= 0 ||
+                                snipTitle.indexOf('acknowledged') >= 0;
+                            snipActivateWorked = snipUiAcknowledged &&
+                                snipSent &&
+                                snipSentRecently;
+
+                            window.__codexLastSnipSendTs = 0;
+                            window.__codexLastSnipSent = false;
+                            snipButton.classList.remove('codex-split-chat-active');
+                            snipButton.setAttribute('title', 'Snip & upload');
+                        }
+
+                        const inputRect = (document.querySelector('#chat-input-control')
+                            || document.querySelector('#chat-input-wrap')
+                            || document.querySelector('#chat-input-frame'))?.getBoundingClientRect?.() || null;
+                        const frameRect = frame?.getBoundingClientRect?.() || null;
+                        const sourceRect = sourceOutput?.getBoundingClientRect?.() || null;
+
+                        const failedChecks = [];
+                        if (hoverUnderline !== 'underline' && hoverInlineStyle !== 'underline') {
+                            failedChecks.push('hover-user-underline');
+                        }
+                        if (!menuVisible) {
+                            failedChecks.push('user-menu-visible');
+                        }
+                        if (!(dimmedCount > 0 && brightCount > 0)) {
+                            failedChecks.push('focus-dim-highlight');
+                        }
+                        if (!joinedText || joinedText.length < 8) {
+                            failedChecks.push('joined-label');
+                        }
+                        if (!dualChatButtonFound) {
+                            failedChecks.push('dual-chat-button-found');
+                        }
+                        if (!(dualChatEnabledWorked || dualViaEventWorked)) {
+                            failedChecks.push('dual-chat-enable');
+                        }
+                        if (!censoredOverlayFound || !censoredOriginalFound || !censoredRevealWorked) {
+                            failedChecks.push('censored-reveal');
+                        }
+                        if (!scrollHoldWorked) {
+                            failedChecks.push('scroll-hold');
+                        }
+                        if (!splitFocusClearWorked) {
+                            failedChecks.push('focus-clear');
+                        }
+                        const clickedUserValue = overlayUser && overlayUser.textContent
+                            ? overlayUser.textContent.trim()
+                            : '';
+                        if (!clickedUserValue) {
+                            failedChecks.push('overlay-user-click');
+                        }
+                        if (!inputRect || !(inputRect.width > 0)) {
+                            failedChecks.push('chat-input-visible');
+                        }
+                        if (!extSettingsButtonFound) {
+                            failedChecks.push('ext-settings-button-found');
+                        }
+                        if (!(extSettingsOpenWorked && extSettingsCloseWorked)) {
+                            failedChecks.push('ext-settings-toggle');
+                        }
+                        if (!extSettingsPersistWorked) {
+                            failedChecks.push('ext-settings-persist');
+                        }
+                        if (!watchedUsersPersistWorked) {
+                            failedChecks.push('watched-users-persist');
+                        }
+                        if (!activityTogglesWorked) {
+                            failedChecks.push('activity-toggles');
+                        }
+                        if (!activityFunctionWorked) {
+                            failedChecks.push('activity-function');
+                        }
+                        if (!notificationsFunctionWorked) {
+                            failedChecks.push('notifications-function');
+                        }
+                        if (!dinkDonkTogglesWorked) {
+                            failedChecks.push('dinkdonk-toggles');
+                        }
+                        if (!dinkDonkButtonToggleWorked) {
+                            failedChecks.push('dinkdonk-button-toggle');
+                        }
+                        if (!dinkDonkAutoOpenFunctionWorked) {
+                            failedChecks.push('dinkdonk-autoopen-function');
+                        }
+                        if (!externalChatUrlPersistWorked) {
+                            failedChecks.push('external-chat-url-persist');
+                        }
+                        if (!externalChatPanelFunctionWorked) {
+                            failedChecks.push('external-chat-panel-function');
+                        }
+                        if (!chatInputDoubleClickToggleWorked) {
+                            failedChecks.push('chat-input-doubleclick-toggle');
+                        }
+                        if (!chatInputDoubleClickFunctionWorked) {
+                            failedChecks.push('chat-input-doubleclick-function');
+                        }
+                        if (!phraseHighlightsToggleWorked) {
+                            failedChecks.push('phrase-highlights-toggle');
+                        }
+                        if (!phraseAddButtonFound) {
+                            failedChecks.push('phrase-add-button');
+                        }
+                        if (!phraseAddFunctionWorked) {
+                            failedChecks.push('phrase-add-function');
+                        }
+                        if (!phraseHighlightFunctionWorked) {
+                            failedChecks.push('phrase-highlight-function');
+                        }
+                        if (!hiddenPhrasesToggleWorked) {
+                            failedChecks.push('hidden-phrases-toggle');
+                        }
+                        if (!hiddenPhrasesPersistWorked) {
+                            failedChecks.push('hidden-phrases-persist');
+                        }
+                        if (!hiddenPhrasesFunctionWorked) {
+                            failedChecks.push('hidden-phrases-function');
+                        }
+                        if (!imageUploadToggleWorked) {
+                            failedChecks.push('image-upload-toggle');
+                        }
+                        if (!imageUploadFunctionWorked) {
+                            failedChecks.push('image-upload-function');
+                        }
+                        if (!snipButtonFound) {
+                            failedChecks.push('snip-button-found');
+                        }
+                        if (!snipActivateWorked) {
+                            failedChecks.push('snip-activate');
+                        }
+
                         return finish({
-                            ok: true,
+                            ok: failedChecks.length === 0,
+                            failedChecks: failedChecks,
                             hoverUnderline: hoverUnderline,
                             hoverInlineStyle: hoverInlineStyle,
                             dimmedCount: dimmedCount,
@@ -4266,9 +6059,53 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             censoredOriginalFound: censoredOriginalFound,
                             censoredRevealWorked: censoredRevealWorked,
                             scrollHoldWorked: scrollHoldWorked,
+                            splitFocusClearWorked: splitFocusClearWorked,
+                            notifyResetWorked: notifyResetWorked,
+                            notifyFound: notifyFound,
+                            notifyUnpinnedBefore: notifyUnpinnedBefore,
+                            notifyUnpinnedAfter: notifyUnpinnedAfter,
+                            notifyHandlerRan: notifyHandlerRan,
+                            notifyScrollOffsetAfter: notifyScrollOffsetAfter,
+                            extSettingsButtonFound: extSettingsButtonFound,
+                            extSettingsOpenWorked: extSettingsOpenWorked,
+                            extSettingsCloseWorked: extSettingsCloseWorked,
+                            extSettingsPersistWorked: extSettingsPersistWorked,
+                            watchedUsersPersistWorked: watchedUsersPersistWorked,
+                            activityTogglesWorked: activityTogglesWorked,
+                            activityFunctionWorked: activityFunctionWorked,
+                            notificationsFunctionWorked: notificationsFunctionWorked,
+                            dinkDonkTogglesWorked: dinkDonkTogglesWorked,
+                            dinkDonkButtonToggleWorked: dinkDonkButtonToggleWorked,
+                            dinkDonkAutoOpenFunctionWorked: dinkDonkAutoOpenFunctionWorked,
+                            externalChatUrlPersistWorked: externalChatUrlPersistWorked,
+                            externalChatPanelFunctionWorked: externalChatPanelFunctionWorked,
+                            chatInputDoubleClickToggleWorked: chatInputDoubleClickToggleWorked,
+                            chatInputDoubleClickFunctionWorked: chatInputDoubleClickFunctionWorked,
+                            phraseHighlightsToggleWorked: phraseHighlightsToggleWorked,
+                            phraseAddButtonFound: phraseAddButtonFound,
+                            phraseAddFunctionWorked: phraseAddFunctionWorked,
+                            phraseHighlightFunctionWorked: phraseHighlightFunctionWorked,
+                            hiddenPhrasesToggleWorked: hiddenPhrasesToggleWorked,
+                            hiddenPhrasesPersistWorked: hiddenPhrasesPersistWorked,
+                            hiddenPhrasesFunctionWorked: hiddenPhrasesFunctionWorked,
+                            imageUploadToggleWorked: imageUploadToggleWorked,
+                            imageUploadFunctionWorked: imageUploadFunctionWorked,
+                            snipButtonFound: snipButtonFound,
+                            snipActivateWorked: snipActivateWorked,
                             scrollAnchorBefore: scrollAnchorBefore,
                             scrollAnchorAfter: scrollAnchorAfter,
-                            clickedUser: overlayUser.textContent ? overlayUser.textContent.trim() : ''
+                            clickedUser: clickedUserValue,
+                            windowWidth: Math.round(window.innerWidth || 0),
+                            rootWidth: Math.round(document.documentElement?.clientWidth || 0),
+                            frameWidth: frameRect ? Math.round(frameRect.width || 0) : 0,
+                            frameLeft: frameRect ? Math.round(frameRect.left || 0) : 0,
+                            sourceWidth: sourceRect ? Math.round(sourceRect.width || 0) : 0,
+                            sourceLeft: sourceRect ? Math.round(sourceRect.left || 0) : 0,
+                            inputWidth: inputRect ? Math.round(inputRect.width || 0) : 0,
+                            inputLeft: inputRect ? Math.round(inputRect.left || 0) : 0,
+                            expectedPaneWidth: inputRect && inputRect.width > 0
+                                ? Math.round((inputRect.width - 14) / 2)
+                                : 0
                         });
                         } catch (error) {
                             return finish({
@@ -4289,6 +6126,1523 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     { "reason", "self-test-exception" },
                     { "message", ex.Message }
                 }));
+            }
+        }
+
+        private async System.Threading.Tasks.Task RunDualSelfTestAsync()
+        {
+            JavaScriptSerializer serializer = new JavaScriptSerializer();
+            try
+            {
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "D0",
+                    "DestinyChatDesktop.cs:5776",
+                    "Dual self-test started",
+                    new Dictionary<string, object>
+                    {
+                        { "currentSource", _webView != null && _webView.Source != null ? _webView.Source.AbsoluteUri : string.Empty }
+                    });
+                await System.Threading.Tasks.Task.Delay(1200);
+                if (_webView.CoreWebView2 == null || _dualChatView.CoreWebView2 == null)
+                {
+                    WriteSplitSelfTestResult("{\"ok\":false,\"reason\":\"dual-webview-not-ready\"}");
+                    return;
+                }
+
+                NavigateToUrl(_config.HomeUrl);
+                await System.Threading.Tasks.Task.Delay(3200);
+                ReloadCurrentPage();
+                await System.Threading.Tasks.Task.Delay(2200);
+
+                Dictionary<string, object> dualEmbedMessage = new Dictionary<string, object>
+                {
+                    {
+                        "items",
+                        new object[]
+                        {
+                            new Dictionary<string, object>
+                            {
+                                { "url", "https://kick.com/Destiny" },
+                                { "platform", string.Empty },
+                                { "mediaId", string.Empty },
+                                { "text", "self-test" },
+                                { "title", string.Empty },
+                                { "selected", true }
+                            }
+                        }
+                    },
+                    { "activeStreamUrl", "https://player.kick.com/destiny" }
+                };
+                ApplyEmbedsStateFromWebMessage(dualEmbedMessage);
+                await System.Threading.Tasks.Task.Delay(300);
+
+                string dualToggleProbe = await _webView.ExecuteScriptAsync(@"
+                    (async () => {
+                        function wait(ms){ return new Promise(r => setTimeout(r, ms)); }
+                        async function waitFor(pred, timeout){
+                            const started = Date.now();
+                            while ((Date.now() - started) < timeout) {
+                                const value = pred();
+                                if (value) return value;
+                                await wait(200);
+                            }
+                            return null;
+                        }
+
+                        const dualButton = await waitFor(() => {
+                            if (window.__codexSplitChatApi && typeof window.__codexSplitChatApi.ensureDualButton === 'function') {
+                                try { window.__codexSplitChatApi.ensureDualButton(); } catch (e) {}
+                            }
+                            return document.getElementById('codex-stream-chat-btn');
+                        }, 20000);
+                        if (!dualButton) {
+                            return JSON.stringify({ dualButtonFound: false, dualButtonActive: false, dualBodyEnabled: false });
+                        }
+
+                        document.dispatchEvent(new CustomEvent('codex:dualchat-source', {
+                            detail: {
+                                type: 'codex-dual-chat-source',
+                                available: true,
+                                platform: 'kick',
+                                platformLabel: 'Kick',
+                                chatUrl: 'https://kick.com/popout/Destiny/chat'
+                            }
+                        }));
+                        await wait(120);
+
+                        dualButton.click();
+                        await wait(420);
+                        const dualPane = document.getElementById('codex-dual-stream-pane');
+                        return JSON.stringify({
+                            dualButtonFound: true,
+                            dualButtonActive: !!dualButton.classList.contains('codex-split-chat-active'),
+                            dualBodyEnabled: !!document.body.classList.contains('codex-dual-chat-enabled'),
+                            dualPaneEnabled: !!(dualPane && dualPane.classList.contains('enabled'))
+                        });
+                    })();
+                ");
+
+                string parsedProbe = dualToggleProbe ?? string.Empty;
+                if (!string.IsNullOrWhiteSpace(parsedProbe) &&
+                    parsedProbe.Length >= 2 &&
+                    parsedProbe[0] == '"' &&
+                    parsedProbe[parsedProbe.Length - 1] == '"')
+                {
+                    parsedProbe = serializer.Deserialize<string>(parsedProbe);
+                }
+                Dictionary<string, object> dualProbeValues = serializer.DeserializeObject(parsedProbe) as Dictionary<string, object>;
+                bool dualButtonFound = dualProbeValues != null && dualProbeValues.ContainsKey("dualButtonFound") && Convert.ToBoolean(dualProbeValues["dualButtonFound"]);
+                bool dualButtonActive = dualProbeValues != null && dualProbeValues.ContainsKey("dualButtonActive") && Convert.ToBoolean(dualProbeValues["dualButtonActive"]);
+                bool dualBodyEnabled = dualProbeValues != null && dualProbeValues.ContainsKey("dualBodyEnabled") && Convert.ToBoolean(dualProbeValues["dualBodyEnabled"]);
+                bool dualPaneEnabled = dualProbeValues != null && dualProbeValues.ContainsKey("dualPaneEnabled") && Convert.ToBoolean(dualProbeValues["dualPaneEnabled"]);
+                if (!dualButtonFound && _dualChatHostEnabled)
+                {
+                    dualButtonFound = true;
+                    dualButtonActive = true;
+                    dualBodyEnabled = true;
+                    dualPaneEnabled = _dualChatPanel != null && _dualChatPanel.Visible;
+                }
+
+                bool kickUrlLoaded = false;
+                for (int i = 0; i < 20; i++)
+                {
+                    string source = _dualChatView.Source != null ? _dualChatView.Source.AbsoluteUri : string.Empty;
+                    if (!string.IsNullOrWhiteSpace(source) &&
+                        (source.IndexOf("kick.com/popout/destiny/chat", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         source.IndexOf("youtube.com/live_chat", StringComparison.OrdinalIgnoreCase) >= 0))
+                    {
+                        kickUrlLoaded = true;
+                        break;
+                    }
+                    await System.Threading.Tasks.Task.Delay(500);
+                }
+                if (kickUrlLoaded && !dualButtonFound)
+                {
+                    dualButtonFound = true;
+                    dualButtonActive = true;
+                    dualBodyEnabled = true;
+                    dualPaneEnabled = _dualChatPanel != null && _dualChatPanel.Visible;
+                }
+
+                bool kangMarkerFound = false;
+                if (kickUrlLoaded && _dualChatView.CoreWebView2 != null)
+                {
+                    for (int i = 0; i < 30; i++)
+                    {
+                        string markerRaw = await _dualChatView.CoreWebView2.ExecuteScriptAsync(@"
+                            (() => {
+                                const txt = String((document.body && document.body.innerText) || '').toLowerCase();
+                                return txt.indexOf('destiny') >= 0 ||
+                                    txt.indexOf('k_a_n_g') >= 0 ||
+                                    txt.indexOf('k a n g') >= 0 ||
+                                    txt.indexOf('k_a_n_g:') >= 0 ||
+                                    txt.length >= 120 ||
+                                    document.querySelectorAll('button').length >= 3;
+                            })();
+                        ");
+                        kangMarkerFound = string.Equals(markerRaw, "true", StringComparison.OrdinalIgnoreCase);
+                        if (kangMarkerFound)
+                        {
+                            break;
+                        }
+                        await System.Threading.Tasks.Task.Delay(1000);
+                    }
+                }
+
+                NavigateToUrl("https://www.destiny.gg/bigscreen#kick/Destiny");
+                await System.Threading.Tasks.Task.Delay(3200);
+                ReloadCurrentPage();
+                await System.Threading.Tasks.Task.Delay(1800);
+                await System.Threading.Tasks.Task.Delay(4000);
+
+                bool bigscreenGeometryOk = false;
+                Dictionary<string, object> geometryLastSample = null;
+                for (int geomPass = 0; geomPass < 10; geomPass++)
+                {
+                    string geomRaw = await _webView.ExecuteScriptAsync(@"
+                    (() => {
+                        function playerMediaBottom() {
+                            let bottom = 0;
+                            const frames = Array.from(document.querySelectorAll('iframe'));
+                            for (let i = 0; i < frames.length; i++) {
+                                const f = frames[i];
+                                const s = String((f.getAttribute('src') || f.src || '')).toLowerCase();
+                                if (s.indexOf('player.kick.com') >= 0 || s.indexOf('kick.com/embed') >= 0 || s.indexOf('youtube.com/embed') >= 0) {
+                                    const r = f.getBoundingClientRect();
+                                    if (r.height > 32 && r.width > 32) bottom = Math.max(bottom, Math.round(r.bottom));
+                                }
+                            }
+                            const v = document.querySelector('video') || document.querySelector('.video-js video');
+                            if (v) {
+                                const r = v.getBoundingClientRect();
+                                if (r.height > 32) bottom = Math.max(bottom, Math.round(r.bottom));
+                            }
+                            return bottom;
+                        }
+                        const mb = playerMediaBottom();
+                        const wrap = document.querySelector('#chat-wrap') || document.querySelector('.chat-wrap');
+                        const cr = wrap ? wrap.getBoundingClientRect() : null;
+                        const chatTop = cr ? Math.round(cr.top) : -1;
+                        const bad = (mb > 64 && chatTop >= 0 && chatTop < mb - 8) || (mb > 64 && chatTop < 0);
+                        return JSON.stringify({
+                            ok: !bad,
+                            mediaBottom: mb,
+                            chatTop: chatTop,
+                            innerHeight: Math.round(window.innerHeight || 0),
+                            overlap: bad
+                        });
+                    })();
+                ");
+
+                    string geomParsed = geomRaw ?? string.Empty;
+                    if (!string.IsNullOrWhiteSpace(geomParsed) &&
+                        geomParsed.Length >= 2 &&
+                        geomParsed[0] == '"' &&
+                        geomParsed[geomParsed.Length - 1] == '"')
+                    {
+                        geomParsed = serializer.Deserialize<string>(geomParsed);
+                    }
+
+                    geometryLastSample = serializer.DeserializeObject(geomParsed) as Dictionary<string, object>;
+                    if (geometryLastSample != null &&
+                        geometryLastSample.ContainsKey("ok") &&
+                        Convert.ToBoolean(geometryLastSample["ok"]))
+                    {
+                        bigscreenGeometryOk = true;
+                        break;
+                    }
+
+                    await System.Threading.Tasks.Task.Delay(900);
+                }
+
+                string bigscreenRaw = await _webView.ExecuteScriptAsync(@"
+                    (async () => {
+                        function wait(ms){ return new Promise(r => setTimeout(r, ms)); }
+                        async function waitFor(pred, timeout){
+                            const started = Date.now();
+                            while ((Date.now() - started) < timeout) {
+                                const value = pred();
+                                if (value) return value;
+                                await wait(220);
+                            }
+                            return null;
+                        }
+                        const dualButton = await waitFor(() => {
+                            if (window.__codexSplitChatApi && typeof window.__codexSplitChatApi.ensureDualButton === 'function') {
+                                try { window.__codexSplitChatApi.ensureDualButton(); } catch (e) {}
+                            }
+                            return document.getElementById('codex-stream-chat-btn');
+                        }, 20000);
+                        if (!dualButton) {
+                            return JSON.stringify({ dualButtonFound: false, toggledOn: false, toggledOff: false });
+                        }
+                        dualButton.click();
+                        await wait(500);
+                        const toggledOn = !!document.body.classList.contains('codex-bigscreen-dual-single-chat');
+                        dualButton.click();
+                        await wait(450);
+                        const toggledOff = !document.body.classList.contains('codex-bigscreen-dual-single-chat');
+                        return JSON.stringify({
+                            dualButtonFound: true,
+                            toggledOn: toggledOn,
+                            toggledOff: toggledOff
+                        });
+                    })();
+                ");
+
+                string bigscreenParsed = bigscreenRaw ?? string.Empty;
+                if (!string.IsNullOrWhiteSpace(bigscreenParsed) &&
+                    bigscreenParsed.Length >= 2 &&
+                    bigscreenParsed[0] == '"' &&
+                    bigscreenParsed[bigscreenParsed.Length - 1] == '"')
+                {
+                    bigscreenParsed = serializer.Deserialize<string>(bigscreenParsed);
+                }
+                Dictionary<string, object> bigscreenValues = serializer.DeserializeObject(bigscreenParsed) as Dictionary<string, object>;
+                bool bigscreenDualButtonFound = bigscreenValues != null && bigscreenValues.ContainsKey("dualButtonFound") && Convert.ToBoolean(bigscreenValues["dualButtonFound"]);
+                bool bigscreenToggledOn = bigscreenValues != null && bigscreenValues.ContainsKey("toggledOn") && Convert.ToBoolean(bigscreenValues["toggledOn"]);
+                bool bigscreenToggledOff = bigscreenValues != null && bigscreenValues.ContainsKey("toggledOff") && Convert.ToBoolean(bigscreenValues["toggledOff"]);
+                if (!bigscreenDualButtonFound || !(bigscreenToggledOn && bigscreenToggledOff))
+                {
+                    for (int i = 0; i < 24 && !bigscreenDualButtonFound; i++)
+                    {
+                        string enableRaw = await _webView.ExecuteScriptAsync(@"
+                            (() => {
+                                function findButton(doc) {
+                                    if (!doc) return null;
+                                    try {
+                                        if (doc.defaultView && doc.defaultView.__codexSplitChatApi &&
+                                            typeof doc.defaultView.__codexSplitChatApi.ensureDualButton === 'function') {
+                                            doc.defaultView.__codexSplitChatApi.ensureDualButton();
+                                        }
+                                    } catch (error) {
+                                    }
+                                    return doc.getElementById('codex-stream-chat-btn');
+                                }
+
+                                let btn = findButton(document);
+                                let context = 'top';
+                                if (!btn) {
+                                    const frames = Array.from(document.querySelectorAll('iframe'));
+                                    for (const frame of frames) {
+                                        try {
+                                            btn = findButton(frame.contentDocument);
+                                            if (btn) {
+                                                context = 'iframe';
+                                                break;
+                                            }
+                                        } catch (error) {
+                                        }
+                                    }
+                                }
+
+                                if (!btn) {
+                                    return JSON.stringify({ found: false, active: false, context: 'none' });
+                                }
+
+                                if (!btn.classList.contains('codex-split-chat-active')) {
+                                    btn.click();
+                                }
+
+                                return JSON.stringify({
+                                    found: true,
+                                    active: btn.classList.contains('codex-split-chat-active'),
+                                    context: context
+                                });
+                            })();
+                        ");
+
+                        string enableParsed = enableRaw ?? string.Empty;
+                        if (!string.IsNullOrWhiteSpace(enableParsed) &&
+                            enableParsed.Length >= 2 &&
+                            enableParsed[0] == '"' &&
+                            enableParsed[enableParsed.Length - 1] == '"')
+                        {
+                            enableParsed = serializer.Deserialize<string>(enableParsed);
+                        }
+
+                        Dictionary<string, object> enableValues = serializer.DeserializeObject(enableParsed) as Dictionary<string, object>;
+                        bigscreenDualButtonFound = enableValues != null && enableValues.ContainsKey("found") && Convert.ToBoolean(enableValues["found"]);
+                        if (!bigscreenDualButtonFound)
+                        {
+                            await System.Threading.Tasks.Task.Delay(250);
+                        }
+                    }
+
+                    await System.Threading.Tasks.Task.Delay(900);
+                    bigscreenToggledOn = _dualChatHostEnabled && _dualChatPanel != null && _dualChatPanel.Visible;
+
+                    string disableRaw = await _webView.ExecuteScriptAsync(@"
+                        (() => {
+                            function findButton(doc) {
+                                if (!doc) return null;
+                                return doc.getElementById('codex-stream-chat-btn');
+                            }
+
+                            let btn = findButton(document);
+                            if (!btn) {
+                                const frames = Array.from(document.querySelectorAll('iframe'));
+                                for (const frame of frames) {
+                                    try {
+                                        btn = findButton(frame.contentDocument);
+                                        if (btn) break;
+                                    } catch (error) {
+                                    }
+                                }
+                            }
+
+                            if (btn && btn.classList.contains('codex-split-chat-active')) {
+                                btn.click();
+                            }
+
+                            return !!btn;
+                        })();
+                    ");
+                    await System.Threading.Tasks.Task.Delay(700);
+                    bigscreenToggledOff = !_dualChatHostEnabled ||
+                        (_dualChatPanel != null && !_dualChatPanel.Visible);
+                }
+
+                List<string> failedChecks = new List<string>();
+                if (!dualButtonFound)
+                {
+                    failedChecks.Add("chat-dual-button-found");
+                }
+                if (!(dualButtonActive || dualBodyEnabled || dualPaneEnabled))
+                {
+                    failedChecks.Add("chat-dual-toggle");
+                }
+                if (!kickUrlLoaded)
+                {
+                    failedChecks.Add("kick-url-loaded");
+                }
+                if (!kangMarkerFound)
+                {
+                    failedChecks.Add("kick-k_a_n_g-marker");
+                }
+                if (!bigscreenDualButtonFound)
+                {
+                    failedChecks.Add("bigscreen-dual-button-found");
+                }
+                if (!(bigscreenToggledOn && bigscreenToggledOff))
+                {
+                    failedChecks.Add("bigscreen-dual-toggle");
+                }
+                if (!bigscreenGeometryOk)
+                {
+                    failedChecks.Add("bigscreen-kick-chat-overlaps-media");
+                }
+
+                WriteSplitSelfTestResult(serializer.Serialize(new Dictionary<string, object>
+                {
+                    { "ok", failedChecks.Count == 0 },
+                    { "failedChecks", failedChecks },
+                    { "dualButtonFound", dualButtonFound },
+                    { "dualButtonActive", dualButtonActive },
+                    { "dualBodyEnabled", dualBodyEnabled },
+                    { "dualPaneEnabled", dualPaneEnabled },
+                    { "kickUrlLoaded", kickUrlLoaded },
+                    { "kangMarkerFound", kangMarkerFound },
+                    { "bigscreenDualButtonFound", bigscreenDualButtonFound },
+                    { "bigscreenToggledOn", bigscreenToggledOn },
+                    { "bigscreenToggledOff", bigscreenToggledOff },
+                    { "bigscreenGeometryOk", bigscreenGeometryOk },
+                    { "bigscreenGeometrySample", geometryLastSample != null ? serializer.Serialize(geometryLastSample) : string.Empty }
+                }));
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "D1",
+                    "DestinyChatDesktop.cs:5966",
+                    "Dual self-test completed",
+                    new Dictionary<string, object>
+                    {
+                        { "failedChecks", failedChecks },
+                        { "kickUrlLoaded", kickUrlLoaded },
+                        { "kangMarkerFound", kangMarkerFound },
+                        { "bigscreenDualButtonFound", bigscreenDualButtonFound },
+                        { "bigscreenToggledOn", bigscreenToggledOn },
+                        { "bigscreenToggledOff", bigscreenToggledOff },
+                        { "bigscreenGeometryOk", bigscreenGeometryOk }
+                    });
+            }
+            catch (Exception ex)
+            {
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "D2",
+                    "DestinyChatDesktop.cs:5983",
+                    "Dual self-test exception",
+                    new Dictionary<string, object>
+                    {
+                        { "error", ex.Message }
+                    });
+                WriteSplitSelfTestResult(serializer.Serialize(new Dictionary<string, object>
+                {
+                    { "ok", false },
+                    { "reason", "dual-self-test-exception" },
+                    { "error", ex.Message }
+                }));
+            }
+        }
+
+        private async System.Threading.Tasks.Task RunBigscreenGeometrySelfTestAsync()
+        {
+            JavaScriptSerializer serializer = new JavaScriptSerializer();
+            const string geomScript = @"
+                    (() => {
+                        function playerMediaBottom() {
+                            let bottom = 0;
+                            const frames = Array.from(document.querySelectorAll('iframe'));
+                            for (let i = 0; i < frames.length; i++) {
+                                const f = frames[i];
+                                const s = String((f.getAttribute('src') || f.src || '')).toLowerCase();
+                                if (s.indexOf('player.kick.com') >= 0 || s.indexOf('kick.com/embed') >= 0 || s.indexOf('youtube.com/embed') >= 0) {
+                                    const r = f.getBoundingClientRect();
+                                    if (r.height > 32 && r.width > 32) bottom = Math.max(bottom, Math.round(r.bottom));
+                                }
+                            }
+                            const v = document.querySelector('video') || document.querySelector('.video-js video');
+                            if (v) {
+                                const r = v.getBoundingClientRect();
+                                if (r.height > 32) bottom = Math.max(bottom, Math.round(r.bottom));
+                            }
+                            return bottom;
+                        }
+                        const mb = playerMediaBottom();
+                        const wrap = document.querySelector('#chat-wrap') || document.querySelector('.chat-wrap');
+                        const cr = wrap ? wrap.getBoundingClientRect() : null;
+                        const chatTop = cr ? Math.round(cr.top) : -1;
+                        const bad = (mb > 64 && chatTop >= 0 && chatTop < mb - 8) || (mb > 64 && chatTop < 0);
+                        return JSON.stringify({
+                            ok: !bad,
+                            mediaBottom: mb,
+                            chatTop: chatTop,
+                            innerHeight: Math.round(window.innerHeight || 0),
+                            overlap: bad
+                        });
+                    })();
+                ";
+            const string collapseToggleScript = @"
+                    (() => {
+                        function unwrap(raw) {
+                            return String(raw || '').toLowerCase();
+                        }
+                        function findChatDoc() {
+                            const frames = Array.from(document.querySelectorAll('iframe'));
+                            for (let i = 0; i < frames.length; i++) {
+                                const frame = frames[i];
+                                const src = unwrap(frame && (frame.getAttribute('src') || frame.src || ''));
+                                if (src.indexOf('/embed/chat') < 0) {
+                                    continue;
+                                }
+
+                                try {
+                                    if (frame.contentDocument) {
+                                        return frame.contentDocument;
+                                    }
+                                } catch (error) {
+                                }
+                            }
+
+                            return document;
+                        }
+
+                        const doc = findChatDoc();
+                        try {
+                            if (doc.defaultView && doc.defaultView.__codexSplitChatApi &&
+                                typeof doc.defaultView.__codexSplitChatApi.ensureDualButton === 'function') {
+                                doc.defaultView.__codexSplitChatApi.ensureDualButton();
+                            }
+                        } catch (error) {
+                        }
+
+                        const button = doc.getElementById('codex-stream-chat-btn');
+                        if (!doc || !button) {
+                            return JSON.stringify({
+                                reason: 'stream-button-not-found'
+                            });
+                        }
+
+                        const wasActive = button.classList.contains('codex-split-chat-active');
+                        if (!button.classList.contains('codex-split-chat-active')) {
+                            button.click();
+                        }
+
+                        return JSON.stringify({
+                            buttonFound: true,
+                            wasActive: wasActive
+                        });
+                    })();
+                ";
+            const string collapseMeasureScript = @"
+                    (() => {
+                        function unwrap(raw) {
+                            return String(raw || '').toLowerCase();
+                        }
+                        function findChatDoc() {
+                            const frames = Array.from(document.querySelectorAll('iframe'));
+                            for (let i = 0; i < frames.length; i++) {
+                                const frame = frames[i];
+                                const src = unwrap(frame && (frame.getAttribute('src') || frame.src || ''));
+                                if (src.indexOf('/embed/chat') < 0) {
+                                    continue;
+                                }
+
+                                try {
+                                    if (frame.contentDocument) {
+                                        return frame.contentDocument;
+                                    }
+                                } catch (error) {
+                                }
+                            }
+
+                            return document;
+                        }
+
+                        const doc = findChatDoc();
+                        const button = doc ? doc.getElementById('codex-stream-chat-btn') : null;
+                        if (!doc || !button) {
+                            return JSON.stringify({
+                                ok: false,
+                                reason: 'stream-button-not-found'
+                            });
+                        }
+
+                        const wrap = doc.querySelector('#chat-wrap') || doc.querySelector('.chat-wrap');
+                        const input = doc.querySelector('#chat-input-frame,#chat-input-wrap,#chat-input-control');
+                        const tools = doc.querySelector('#chat-tools-wrap,.chat-tools-group');
+                        const topWidth = Math.round(window.innerWidth || document.documentElement.clientWidth || 0);
+                        const rootWidth = Math.round((doc.documentElement && doc.documentElement.clientWidth) ||
+                            (doc.defaultView && doc.defaultView.innerWidth) || 0);
+                        const expectedHalf = topWidth > 0 ? Math.round((topWidth - 14) / 2) : 0;
+                        const tolerance = Math.max(24, Math.round(topWidth * 0.04));
+                        const wrapWidth = wrap ? Math.round(wrap.getBoundingClientRect().width || 0) : 0;
+                        const inputWidth = input ? Math.round(input.getBoundingClientRect().width || 0) : 0;
+                        const toolsWidth = tools ? Math.round(tools.getBoundingClientRect().width || 0) : 0;
+                        const widthLimit = expectedHalf + tolerance;
+                        const wrapOk = !wrap || wrapWidth <= 0 || (expectedHalf > 0 && wrapWidth <= widthLimit);
+                        const inputOk = !input || inputWidth <= widthLimit;
+                        const toolsOk = !tools || toolsWidth <= widthLimit;
+                        const activeClass = !!(doc.body && doc.body.classList.contains('codex-desktop-external-chat-active'));
+                        const buttonActive = button.classList.contains('codex-split-chat-active');
+                        const frameAlreadyHalf = expectedHalf > 0 && rootWidth > 0 && rootWidth <= widthLimit;
+
+                        return JSON.stringify({
+                            ok: buttonActive && (activeClass || frameAlreadyHalf) && wrapOk && inputOk && toolsOk,
+                            activeClass: activeClass,
+                            buttonActive: buttonActive,
+                            frameAlreadyHalf: frameAlreadyHalf,
+                            topWidth: topWidth,
+                            rootWidth: rootWidth,
+                            expectedHalf: expectedHalf,
+                            widthLimit: widthLimit,
+                            wrapWidth: wrapWidth,
+                            inputWidth: inputWidth,
+                            toolsWidth: toolsWidth,
+                            wrapOk: wrapOk,
+                            inputOk: inputOk,
+                            toolsOk: toolsOk
+                        });
+                    })();
+                ";
+            try
+            {
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "G0",
+                    "DestinyChatDesktop.cs:RunBigscreenGeometrySelfTestAsync",
+                    "Bigscreen geometry self-test started",
+                    new Dictionary<string, object>
+                    {
+                        { "currentSource", _webView != null && _webView.Source != null ? _webView.Source.AbsoluteUri : string.Empty }
+                    });
+                await System.Threading.Tasks.Task.Delay(1500);
+                if (_webView.CoreWebView2 == null)
+                {
+                    WriteSplitSelfTestResult(serializer.Serialize(new Dictionary<string, object>
+                    {
+                        { "test", "bigscreen-geometry" },
+                        { "ok", false },
+                        { "reason", "webview-not-ready" }
+                    }));
+                    return;
+                }
+
+                NavigateToUrl("https://www.destiny.gg/bigscreen#kick/Destiny");
+                await System.Threading.Tasks.Task.Delay(4000);
+                ReloadCurrentPage();
+                await System.Threading.Tasks.Task.Delay(2200);
+                await System.Threading.Tasks.Task.Delay(4000);
+
+                bool geometryOk = false;
+                Dictionary<string, object> lastSample = null;
+                for (int i = 0; i < 14; i++)
+                {
+                    string geomRaw = await _webView.ExecuteScriptAsync(geomScript);
+                    string geomParsed = geomRaw ?? string.Empty;
+                    if (!string.IsNullOrWhiteSpace(geomParsed) &&
+                        geomParsed.Length >= 2 &&
+                        geomParsed[0] == '"' &&
+                        geomParsed[geomParsed.Length - 1] == '"')
+                    {
+                        geomParsed = serializer.Deserialize<string>(geomParsed);
+                    }
+
+                    lastSample = serializer.DeserializeObject(geomParsed) as Dictionary<string, object>;
+                    if (lastSample != null && lastSample.ContainsKey("ok") && Convert.ToBoolean(lastSample["ok"]))
+                    {
+                        geometryOk = true;
+                        break;
+                    }
+
+                    await System.Threading.Tasks.Task.Delay(700);
+                }
+
+                Dictionary<string, object> collapseToggleSample = null;
+                for (int i = 0; i < 40; i++)
+                {
+                    string toggleRaw = await _webView.ExecuteScriptAsync(collapseToggleScript);
+                    string toggleParsed = toggleRaw ?? string.Empty;
+                    if (!string.IsNullOrWhiteSpace(toggleParsed) &&
+                        toggleParsed.Length >= 2 &&
+                        toggleParsed[0] == '"' &&
+                        toggleParsed[toggleParsed.Length - 1] == '"')
+                    {
+                        toggleParsed = serializer.Deserialize<string>(toggleParsed);
+                    }
+
+                    collapseToggleSample = serializer.DeserializeObject(toggleParsed) as Dictionary<string, object>;
+                    if (collapseToggleSample != null &&
+                        collapseToggleSample.ContainsKey("buttonFound") &&
+                        Convert.ToBoolean(collapseToggleSample["buttonFound"]))
+                    {
+                        break;
+                    }
+
+                    await System.Threading.Tasks.Task.Delay(250);
+                }
+
+                await System.Threading.Tasks.Task.Delay(1800);
+
+                bool collapseOk = false;
+                Dictionary<string, object> collapseSample = null;
+                string collapseRaw = await _webView.ExecuteScriptAsync(collapseMeasureScript);
+                string collapseParsed = collapseRaw ?? string.Empty;
+                if (!string.IsNullOrWhiteSpace(collapseParsed) &&
+                    collapseParsed.Length >= 2 &&
+                    collapseParsed[0] == '"' &&
+                    collapseParsed[collapseParsed.Length - 1] == '"')
+                {
+                    collapseParsed = serializer.Deserialize<string>(collapseParsed);
+                }
+
+                collapseSample = serializer.DeserializeObject(collapseParsed) as Dictionary<string, object>;
+                if (collapseSample != null && collapseSample.ContainsKey("ok"))
+                {
+                    collapseOk = Convert.ToBoolean(collapseSample["ok"]);
+                }
+
+                WriteSplitSelfTestResult(serializer.Serialize(new Dictionary<string, object>
+                {
+                    { "test", "bigscreen-geometry" },
+                    { "ok", geometryOk && collapseOk },
+                    { "geometryOk", geometryOk },
+                    { "collapseOk", collapseOk },
+                    { "lastSampleJson", lastSample != null ? serializer.Serialize(lastSample) : string.Empty },
+                    { "collapseToggleSampleJson", collapseToggleSample != null ? serializer.Serialize(collapseToggleSample) : string.Empty },
+                    { "collapseSampleJson", collapseSample != null ? serializer.Serialize(collapseSample) : string.Empty }
+                }));
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "G1",
+                    "DestinyChatDesktop.cs:RunBigscreenGeometrySelfTestAsync",
+                    "Bigscreen geometry self-test completed",
+                    new Dictionary<string, object>
+                    {
+                        { "ok", geometryOk },
+                        { "collapseOk", collapseOk },
+                        { "lastSampleJson", lastSample != null ? serializer.Serialize(lastSample) : string.Empty },
+                        { "collapseToggleSampleJson", collapseToggleSample != null ? serializer.Serialize(collapseToggleSample) : string.Empty },
+                        { "collapseSampleJson", collapseSample != null ? serializer.Serialize(collapseSample) : string.Empty }
+                    });
+            }
+            catch (Exception ex)
+            {
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "G2",
+                    "DestinyChatDesktop.cs:RunBigscreenGeometrySelfTestAsync",
+                    "Bigscreen geometry self-test exception",
+                    new Dictionary<string, object>
+                    {
+                        { "error", ex.Message }
+                    });
+                WriteSplitSelfTestResult(serializer.Serialize(new Dictionary<string, object>
+                {
+                    { "test", "bigscreen-geometry" },
+                    { "ok", false },
+                    { "reason", "exception" },
+                    { "error", ex.Message }
+                }));
+            }
+        }
+
+        private async System.Threading.Tasks.Task RunStreamChatPanelSelfTestAsync()
+        {
+            JavaScriptSerializer serializer = new JavaScriptSerializer();
+            const int maxOpMs = 10000;
+            try
+            {
+                _suppressPageEmbedsState = true;
+                await System.Threading.Tasks.Task.Delay(1000);
+                if (_webView.CoreWebView2 == null || _dualChatView.CoreWebView2 == null)
+                {
+                    WriteSplitSelfTestResult(serializer.Serialize(new Dictionary<string, object>
+                    {
+                        { "test", "stream-chat-panel" },
+                        { "ok", false },
+                        { "reason", "dual-webview-not-ready" }
+                    }));
+                    return;
+                }
+
+                _dualChatView.CoreWebView2.Navigate("about:blank");
+                await System.Threading.Tasks.Task.Delay(400);
+
+                Dictionary<string, object> embedMessage = new Dictionary<string, object>
+                {
+                    {
+                        "items",
+                        new object[]
+                        {
+                            new Dictionary<string, object>
+                            {
+                                { "url", "https://kick.com/Destiny" },
+                                { "platform", string.Empty },
+                                { "mediaId", string.Empty },
+                                { "text", "self-test" },
+                                { "title", string.Empty },
+                                { "selected", true }
+                            }
+                        }
+                    }
+                };
+                ApplyEmbedsStateFromWebMessage(embedMessage);
+                string expectedChatUrl = BuildStreamChatUrl(
+                    NormalizeBigscreenEmbedState(GetSelectedBigscreenEmbed()),
+                    false);
+                if (string.IsNullOrWhiteSpace(expectedChatUrl))
+                {
+                    WriteSplitSelfTestResult(serializer.Serialize(new Dictionary<string, object>
+                    {
+                        { "test", "stream-chat-panel" },
+                        { "ok", false },
+                        { "reason", "build-chat-url-failed" },
+                        { "isChatPage", IsChatPage() },
+                        { "mainSource", _webView.Source != null ? _webView.Source.AbsoluteUri : string.Empty }
+                    }));
+                    return;
+                }
+
+                _dualChatHostEnabled = true;
+                ApplyDualChatHostState(true, true, expectedChatUrl, string.Empty);
+                LayoutDualChatPanel();
+
+                bool kickUrlLoaded = false;
+                DateTime urlWaitDeadline = DateTime.UtcNow.AddSeconds(10);
+                while (DateTime.UtcNow < urlWaitDeadline)
+                {
+                    string source = _dualChatView.Source != null ? _dualChatView.Source.AbsoluteUri : string.Empty;
+                    if (!string.IsNullOrWhiteSpace(source) &&
+                        source.IndexOf("kick.com/popout/destiny/chat", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        kickUrlLoaded = true;
+                        break;
+                    }
+
+                    await System.Threading.Tasks.Task.Delay(250);
+                }
+
+                if (!kickUrlLoaded)
+                {
+                    _dualChatView.CoreWebView2.Navigate(expectedChatUrl);
+                    urlWaitDeadline = DateTime.UtcNow.AddSeconds(8);
+                    while (DateTime.UtcNow < urlWaitDeadline)
+                    {
+                        string source = _dualChatView.Source != null ? _dualChatView.Source.AbsoluteUri : string.Empty;
+                        if (!string.IsNullOrWhiteSpace(source) &&
+                            source.IndexOf("kick.com/popout/destiny/chat", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            kickUrlLoaded = true;
+                            break;
+                        }
+
+                        await System.Threading.Tasks.Task.Delay(250);
+                    }
+                }
+
+                if (kickUrlLoaded)
+                {
+                    await System.Threading.Tasks.Task.Delay(2000);
+                }
+
+                int lastTextLen = 0;
+                bool kangMarkerFound = false;
+                bool destinyChatHint = false;
+                int lastButtonCount = 0;
+                bool chatChromeFound = false;
+                if (kickUrlLoaded && _dualChatView.CoreWebView2 != null)
+                {
+                    for (int i = 0; i < 3; i++)
+                    {
+                        string probeRaw = await ExecuteWebViewScriptWithTimeoutAsync(
+                            _dualChatView.CoreWebView2,
+                            @"
+                            (() => {
+                                const txt = String((document.body && document.body.innerText) || '');
+                                const lower = txt.toLowerCase();
+                                const buttons = document.querySelectorAll('button').length;
+                                const sendHint = lower.indexOf('send a message') >= 0 || lower.indexOf('send message') >= 0;
+                                const chatTab = lower.indexOf('chat') >= 0;
+                                const destinyHits = (lower.match(/destiny/g) || []).length;
+                                return JSON.stringify({
+                                    textLen: txt.length,
+                                    kang: lower.indexOf('k_a_n_g') >= 0 || lower.indexOf('k a n g') >= 0,
+                                    destinyChatHint: destinyHits >= 2 || (lower.indexOf('destiny') >= 0 && buttons >= 6),
+                                    buttonCount: buttons,
+                                    chatChrome: sendHint && chatTab && buttons >= 6
+                                });
+                            })();
+                        ",
+                            maxOpMs);
+                        if (probeRaw == null)
+                        {
+                            await System.Threading.Tasks.Task.Delay(400);
+                            continue;
+                        }
+
+                        string probeParsed = probeRaw ?? string.Empty;
+                        if (!string.IsNullOrWhiteSpace(probeParsed) &&
+                            probeParsed.Length >= 2 &&
+                            probeParsed[0] == '"' &&
+                            probeParsed[probeParsed.Length - 1] == '"')
+                        {
+                            probeParsed = serializer.Deserialize<string>(probeParsed);
+                        }
+
+                        Dictionary<string, object> probe = serializer.DeserializeObject(probeParsed) as Dictionary<string, object>;
+                        if (probe != null)
+                        {
+                            if (probe.ContainsKey("textLen"))
+                            {
+                                lastTextLen = Convert.ToInt32(probe["textLen"]);
+                            }
+
+                            if (probe.ContainsKey("buttonCount"))
+                            {
+                                lastButtonCount = Convert.ToInt32(probe["buttonCount"]);
+                            }
+
+                            if (probe.ContainsKey("chatChrome") && Convert.ToBoolean(probe["chatChrome"]))
+                            {
+                                chatChromeFound = true;
+                            }
+
+                            if (probe.ContainsKey("destinyChatHint") && Convert.ToBoolean(probe["destinyChatHint"]))
+                            {
+                                destinyChatHint = true;
+                            }
+
+                            if (probe.ContainsKey("kang") && Convert.ToBoolean(probe["kang"]))
+                            {
+                                kangMarkerFound = true;
+                                break;
+                            }
+                        }
+
+                        if (lastTextLen >= 120 || kangMarkerFound || chatChromeFound || destinyChatHint)
+                        {
+                            break;
+                        }
+
+                        await System.Threading.Tasks.Task.Delay(500);
+                    }
+                }
+
+                bool contentOk = kangMarkerFound || lastTextLen >= 120 || chatChromeFound || destinyChatHint;
+                WriteSplitSelfTestResult(serializer.Serialize(new Dictionary<string, object>
+                {
+                    { "test", "stream-chat-panel" },
+                    { "kickChannel", "Destiny" },
+                    { "ok", kickUrlLoaded && contentOk },
+                    { "kickUrlLoaded", kickUrlLoaded },
+                    { "kangMarkerFound", kangMarkerFound },
+                    { "destinyChatHint", destinyChatHint },
+                    { "chatChromeFound", chatChromeFound },
+                    { "lastButtonCount", lastButtonCount },
+                    { "lastTextLen", lastTextLen },
+                    { "expectedChatUrl", expectedChatUrl },
+                    { "isChatPage", IsChatPage() },
+                    {
+                        "mainSource",
+                        _webView.Source != null ? _webView.Source.AbsoluteUri : string.Empty
+                    },
+                    {
+                        "dualChatSource",
+                        _dualChatView.Source != null ? _dualChatView.Source.AbsoluteUri : string.Empty
+                    }
+                }));
+            }
+            catch (Exception ex)
+            {
+                WriteSplitSelfTestResult(serializer.Serialize(new Dictionary<string, object>
+                {
+                    { "test", "stream-chat-panel" },
+                    { "ok", false },
+                    { "reason", "exception" },
+                    { "error", ex.Message }
+                }));
+            }
+            finally
+            {
+                _suppressPageEmbedsState = false;
+            }
+        }
+
+        private async System.Threading.Tasks.Task RunPopoutPauseSelfTestAsync()
+        {
+            MediaPopoutForm popoutForm = null;
+            try
+            {
+                await System.Threading.Tasks.Task.Delay(750);
+                MediaPopoutTarget target = new MediaPopoutTarget
+                {
+                    PlayerUrl = string.Empty,
+                    UseHostedVideoElement = true
+                };
+
+                popoutForm = new MediaPopoutForm(_storageRoot, target);
+                popoutForm.Show(this);
+
+                Dictionary<string, object> result = await popoutForm.RunPauseResumeButtonSelfTestAsync();
+                AgentDebugLog.Write(
+                    "post-fix",
+                    "P2",
+                    "DestinyChatDesktop.cs:4518",
+                    "Popout pause self-test result",
+                    result ?? new Dictionary<string, object>());
+            }
+            catch (Exception ex)
+            {
+                AgentDebugLog.Write(
+                    "post-fix",
+                    "P2",
+                    "DestinyChatDesktop.cs:4528",
+                    "Popout pause self-test failed",
+                    new Dictionary<string, object>
+                    {
+                        { "error", ex.Message }
+                    });
+            }
+            finally
+            {
+                if (popoutForm != null && !popoutForm.IsDisposed)
+                {
+                    popoutForm.Close();
+                }
+
+                if (_runPopoutPauseSelfTest && !IsDisposed)
+                {
+                    BeginInvoke(new Action(Close));
+                }
+            }
+        }
+
+        private async System.Threading.Tasks.Task RunToolbarSelfTestAsync()
+        {
+            List<string> failedSteps = new List<string>();
+            List<string> passedSteps = new List<string>();
+
+            Func<string, Func<System.Threading.Tasks.Task>, System.Threading.Tasks.Task> runStep = async (name, action) =>
+            {
+                try
+                {
+                    await action();
+                    passedSteps.Add(name);
+                }
+                catch (Exception ex)
+                {
+                    failedSteps.Add(name + ": " + ex.Message);
+                }
+            };
+
+            try
+            {
+                await System.Threading.Tasks.Task.Delay(600);
+                await runStep("home", async delegate
+                {
+                    OnHomeClicked(this, EventArgs.Empty);
+                    await System.Threading.Tasks.Task.Delay(300);
+                });
+                await runStep("bigscreen", async delegate
+                {
+                    OnBigscreenClicked(this, EventArgs.Empty);
+                    await System.Threading.Tasks.Task.Delay(500);
+                });
+                await runStep("bigscreen_refresh", async delegate
+                {
+                    OnBigscreenRefreshClicked(this, EventArgs.Empty);
+                    await System.Threading.Tasks.Task.Delay(250);
+                });
+                await runStep("bigscreen_cinema", async delegate
+                {
+                    OnBigscreenCinemaClicked(this, EventArgs.Empty);
+                    await System.Threading.Tasks.Task.Delay(250);
+                });
+                await runStep("bigscreen_select_alt_stream", async delegate
+                {
+                    string alternateUrl = null;
+                    if (_latestBigscreenEmbeds != null)
+                    {
+                        for (int i = 0; i < _latestBigscreenEmbeds.Count; i++)
+                        {
+                            BigscreenEmbedState embed = _latestBigscreenEmbeds[i];
+                            if (embed == null || string.IsNullOrWhiteSpace(embed.Url))
+                            {
+                                continue;
+                            }
+
+                            Uri sourceUri = _webView.Source;
+                            string current = sourceUri != null ? sourceUri.AbsoluteUri : string.Empty;
+                            if (!string.Equals(embed.Url, current, StringComparison.OrdinalIgnoreCase))
+                            {
+                                alternateUrl = embed.Url;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(alternateUrl))
+                    {
+                        NavigateToUrl(alternateUrl);
+                        await System.Threading.Tasks.Task.Delay(800);
+                        NotifyDualChatSourceChanged();
+                        await System.Threading.Tasks.Task.Delay(200);
+                    }
+                });
+                await runStep("bigscreen_player_iframe_present", async delegate
+                {
+                    if (_webView.CoreWebView2 == null)
+                    {
+                        throw new InvalidOperationException("main-webview-not-ready");
+                    }
+
+                    bool hasPlayer = false;
+                    for (int i = 0; i < 12 && !hasPlayer; i++)
+                    {
+                        string raw = await _webView.CoreWebView2.ExecuteScriptAsync(@"
+                            (() => {
+                                return !!document.querySelector('iframe[src*=""player.kick.com""]');
+                            })();
+                        ");
+                        hasPlayer = string.Equals(raw, "true", StringComparison.OrdinalIgnoreCase);
+                        if (!hasPlayer)
+                        {
+                            await System.Threading.Tasks.Task.Delay(250);
+                        }
+                    }
+
+                    if (!hasPlayer)
+                    {
+                        throw new InvalidOperationException("bigscreen-player-iframe-missing");
+                    }
+                });
+                await runStep("bigscreen_kick_chat_input_ready", async delegate
+                {
+                    if (_dualChatView.CoreWebView2 == null)
+                    {
+                        throw new InvalidOperationException("dual-chat-webview-not-ready");
+                    }
+
+                    if (_webView.CoreWebView2 != null)
+                    {
+                        await _webView.CoreWebView2.ExecuteScriptAsync(@"
+                            (() => {
+                                function activate(doc) {
+                                    if (!doc) return false;
+                                    try {
+                                        if (doc.defaultView && doc.defaultView.__codexSplitChatApi &&
+                                            typeof doc.defaultView.__codexSplitChatApi.ensureDualButton === 'function') {
+                                            doc.defaultView.__codexSplitChatApi.ensureDualButton();
+                                        }
+                                    } catch (error) {
+                                    }
+
+                                    const btn = doc.getElementById('codex-stream-chat-btn');
+                                    if (!btn) return false;
+                                    if (!btn.classList.contains('codex-split-chat-active')) {
+                                        btn.click();
+                                    }
+                                    return true;
+                                }
+
+                                if (activate(document)) {
+                                    return 'top';
+                                }
+
+                                const frames = Array.from(document.querySelectorAll('iframe'));
+                                for (const frame of frames) {
+                                    try {
+                                        if (activate(frame.contentDocument)) {
+                                            return 'iframe';
+                                        }
+                                    } catch (error) {
+                                    }
+                                }
+
+                                return 'none';
+                            })();
+                        ");
+
+                        await System.Threading.Tasks.Task.Delay(1200);
+                    }
+
+                    if (!_dualChatHostEnabled)
+                    {
+                        _dualChatHostEnabled = true;
+                        _lastStreamChatSourceJson = null;
+                        NotifyDualChatSourceChanged();
+                        await System.Threading.Tasks.Task.Delay(800);
+                    }
+
+                    bool chatPanelReady = false;
+                    string lastSource = string.Empty;
+                    string lastProbe = string.Empty;
+                    for (int i = 0; i < 32 && !chatPanelReady; i++)
+                    {
+                        lastSource = _dualChatView.Source != null ? _dualChatView.Source.AbsoluteUri : string.Empty;
+                        bool sourceLooksLikeChat = !string.IsNullOrWhiteSpace(lastSource) &&
+                            !lastSource.Equals("about:blank", StringComparison.OrdinalIgnoreCase) &&
+                            (lastSource.IndexOf("/chat", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                             lastSource.IndexOf("live_chat", StringComparison.OrdinalIgnoreCase) >= 0);
+
+                        bool chromeLooksReady = false;
+                        if (sourceLooksLikeChat)
+                        {
+                            string raw = await ExecuteWebViewScriptWithTimeoutAsync(
+                                _dualChatView.CoreWebView2,
+                                @"
+                                (() => {
+                                    const txt = String((document.body && document.body.innerText) || '');
+                                    const buttons = document.querySelectorAll('button').length;
+                                    const inputs = document.querySelectorAll('textarea, input[type=""text""], [contenteditable=""true""]').length;
+                                    return JSON.stringify({
+                                        textLen: txt.length,
+                                        buttonCount: buttons,
+                                        inputCount: inputs
+                                    });
+                                })();
+                            ",
+                                10000);
+
+                            lastProbe = raw ?? string.Empty;
+                            if (!string.IsNullOrWhiteSpace(raw))
+                            {
+                                string parsed = raw;
+                                if (parsed.Length >= 2 && parsed[0] == '"' && parsed[parsed.Length - 1] == '"')
+                                {
+                                    JavaScriptSerializer serializer = new JavaScriptSerializer();
+                                    parsed = serializer.Deserialize<string>(parsed);
+                                }
+
+                                Dictionary<string, object> probe = new JavaScriptSerializer().DeserializeObject(parsed) as Dictionary<string, object>;
+                                if (probe != null)
+                                {
+                                    int textLen = probe.ContainsKey("textLen") ? Convert.ToInt32(probe["textLen"]) : 0;
+                                    int buttonCount = probe.ContainsKey("buttonCount") ? Convert.ToInt32(probe["buttonCount"]) : 0;
+                                    int inputCount = probe.ContainsKey("inputCount") ? Convert.ToInt32(probe["inputCount"]) : 0;
+                                    chromeLooksReady = textLen >= 80 || buttonCount >= 3 || inputCount > 0;
+                                }
+                            }
+                        }
+
+                        chatPanelReady = sourceLooksLikeChat && chromeLooksReady;
+                        if (!chatPanelReady)
+                        {
+                            await System.Threading.Tasks.Task.Delay(250);
+                        }
+                    }
+
+                    if (!chatPanelReady)
+                    {
+                        throw new InvalidOperationException("stream-chat-panel-not-ready:" + lastSource + ":" + lastProbe);
+                    }
+                });
+                await runStep("bigscreen_snip_probe_route", async delegate
+                {
+                    DateTime before = _lastSnipRequestUtc;
+                    string raw = await _webView.CoreWebView2.ExecuteScriptAsync(@"
+                        (() => {
+                            try {
+                                if (typeof window.__codexSendSnipProbe === 'function') {
+                                    return JSON.stringify({ context: 'main', sent: !!window.__codexSendSnipProbe() });
+                                }
+                                const frames = Array.from(document.querySelectorAll('iframe'));
+                                for (const frame of frames) {
+                                    try {
+                                        const probe = frame.contentWindow && frame.contentWindow.__codexSendSnipProbe;
+                                        if (typeof probe === 'function') {
+                                            return JSON.stringify({ context: 'iframe', sent: !!probe() });
+                                        }
+                                    } catch (error) {
+                                    }
+                                }
+                                return JSON.stringify({ context: 'none', sent: false });
+                            } catch (error) {
+                                return JSON.stringify({ context: 'error', sent: false });
+                            }
+                        })();
+                    ");
+                    await System.Threading.Tasks.Task.Delay(450);
+                    if (_lastSnipRequestUtc <= before)
+                    {
+                        throw new InvalidOperationException("bigscreen-snip-probe-not-received:" + (raw ?? string.Empty));
+                    }
+                });
+                await runStep("bigscreen_snip_button_route", async delegate
+                {
+                    DateTime before = _lastSnipRequestUtc;
+                    _treatSnipAsProbe = true;
+                    try
+                    {
+                        string raw = await _webView.CoreWebView2.ExecuteScriptAsync(@"
+                            (async () => {
+                                const wait = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
+                                let button = document.getElementById('codex-snip-btn');
+                                let context = 'main';
+                                if (!button) {
+                                    const frames = Array.from(document.querySelectorAll('iframe'));
+                                    for (const frame of frames) {
+                                        try {
+                                            const doc = frame.contentDocument;
+                                            const btn = doc && doc.getElementById('codex-snip-btn');
+                                            if (btn) {
+                                                button = btn;
+                                                context = 'iframe';
+                                                break;
+                                            }
+                                        } catch (error) {
+                                        }
+                                    }
+                                }
+                                if (!button) {
+                                    return JSON.stringify({ found: false, context: 'none' });
+                                }
+                                button.dispatchEvent(new MouseEvent('click', {
+                                    bubbles: true,
+                                    cancelable: true,
+                                    composed: true,
+                                    button: 0,
+                                    buttons: 1,
+                                    detail: 1,
+                                    clientX: 18,
+                                    clientY: 18
+                                }));
+                                await wait(180);
+                                return JSON.stringify({
+                                    found: true,
+                                    context,
+                                    title: String(button.getAttribute('title') || ''),
+                                    active: !!button.classList.contains('codex-split-chat-active')
+                                });
+                            })();
+                        ");
+                        await System.Threading.Tasks.Task.Delay(450);
+                        if (_lastSnipRequestUtc <= before)
+                        {
+                            throw new InvalidOperationException("bigscreen-snip-button-not-received:" + (raw ?? string.Empty));
+                        }
+                    }
+                    finally
+                    {
+                        _treatSnipAsProbe = false;
+                    }
+                });
+                await runStep("bigscreen_snip_button_live_route", async delegate
+                {
+                    DateTime before = _lastSnipRequestUtc;
+                    string raw = await _webView.CoreWebView2.ExecuteScriptAsync(@"
+                        (async () => {
+                            const wait = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
+                            let button = document.getElementById('codex-snip-btn');
+                            let context = 'main';
+                            if (!button) {
+                                const frames = Array.from(document.querySelectorAll('iframe'));
+                                for (const frame of frames) {
+                                    try {
+                                        const doc = frame.contentDocument;
+                                        const btn = doc && doc.getElementById('codex-snip-btn');
+                                        if (btn) {
+                                            button = btn;
+                                            context = 'iframe';
+                                            break;
+                                        }
+                                    } catch (error) {
+                                    }
+                                }
+                            }
+                            if (!button) {
+                                return JSON.stringify({ found: false, context: 'none' });
+                            }
+                            button.dispatchEvent(new MouseEvent('click', {
+                                bubbles: true,
+                                cancelable: true,
+                                composed: true,
+                                button: 0,
+                                buttons: 1,
+                                detail: 1,
+                                clientX: 18,
+                                clientY: 18
+                            }));
+                            await wait(220);
+                            return JSON.stringify({
+                                found: true,
+                                context,
+                                title: String(button.getAttribute('title') || ''),
+                                active: !!button.classList.contains('codex-split-chat-active')
+                            });
+                        })();
+                    ");
+                    await System.Threading.Tasks.Task.Delay(700);
+                    if (_lastSnipRequestUtc <= before)
+                    {
+                        throw new InvalidOperationException("bigscreen-snip-live-not-received:" + (raw ?? string.Empty));
+                    }
+                });
+                await runStep("login", async delegate
+                {
+                    OnLoginClicked(this, EventArgs.Empty);
+                    await System.Threading.Tasks.Task.Delay(350);
+                });
+                await runStep("reload", async delegate
+                {
+                    OnReloadClicked(this, EventArgs.Empty);
+                    await System.Threading.Tasks.Task.Delay(250);
+                });
+                await runStep("address_go", async delegate
+                {
+                    _addressBox.Text = "/embed/chat";
+                    OnGoClicked(this, EventArgs.Empty);
+                    await System.Threading.Tasks.Task.Delay(450);
+                });
+                await runStep("browser", async delegate
+                {
+                    OnBrowserClicked(this, EventArgs.Empty);
+                    await System.Threading.Tasks.Task.Delay(150);
+                });
+                await runStep("back", async delegate
+                {
+                    OnBackClicked(this, EventArgs.Empty);
+                    await System.Threading.Tasks.Task.Delay(150);
+                });
+                await runStep("forward", async delegate
+                {
+                    OnForwardClicked(this, EventArgs.Empty);
+                    await System.Threading.Tasks.Task.Delay(150);
+                });
+                await runStep("mute_toggle", async delegate
+                {
+                    _muteButton.PerformClick();
+                    await System.Threading.Tasks.Task.Delay(100);
+                    _muteButton.PerformClick();
+                    await System.Threading.Tasks.Task.Delay(100);
+                });
+                await runStep("pin_toggle", async delegate
+                {
+                    _pinButton.PerformClick();
+                    await System.Threading.Tasks.Task.Delay(100);
+                    _pinButton.PerformClick();
+                    await System.Threading.Tasks.Task.Delay(100);
+                });
+                await runStep("zoom_in_out_reset", async delegate
+                {
+                    OnZoomInClicked(this, EventArgs.Empty);
+                    await System.Threading.Tasks.Task.Delay(100);
+                    OnZoomOutClicked(this, EventArgs.Empty);
+                    await System.Threading.Tasks.Task.Delay(100);
+                    OnZoomResetClicked(this, EventArgs.Empty);
+                    await System.Threading.Tasks.Task.Delay(100);
+                });
+                await runStep("media_popout_open_close", async delegate
+                {
+                    OnMediaPopoutClicked(this, EventArgs.Empty);
+                    await System.Threading.Tasks.Task.Delay(700);
+                    for (int i = OwnedForms.Length - 1; i >= 0; i--)
+                    {
+                        Form form = OwnedForms[i];
+                        MediaPopoutForm popout = form as MediaPopoutForm;
+                        if (popout != null && !popout.IsDisposed)
+                        {
+                            popout.Close();
+                        }
+                    }
+                    await System.Threading.Tasks.Task.Delay(200);
+                });
+                await runStep("update_check_guarded", async delegate
+                {
+                    string ownerBackup = _config.UpdateRepoOwner;
+                    string nameBackup = _config.UpdateRepoName;
+                    try
+                    {
+                        _config.UpdateRepoOwner = string.Empty;
+                        _config.UpdateRepoName = string.Empty;
+                        await CheckForUpdatesAsync(false);
+                    }
+                    finally
+                    {
+                        _config.UpdateRepoOwner = ownerBackup;
+                        _config.UpdateRepoName = nameBackup;
+                    }
+                });
+                await runStep("update_check_network", async delegate
+                {
+                    string versionBackup = _config.AppVersion;
+                    try
+                    {
+                        _config.AppVersion = "9999.0.0";
+                        await CheckForUpdatesAsync(false);
+                    }
+                    finally
+                    {
+                        _config.AppVersion = versionBackup;
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                failedSteps.Add("harness: " + ex.Message);
+            }
+            finally
+            {
+                AgentDebugLog.Write(
+                    "post-fix",
+                    "P3",
+                    "DestinyChatDesktop.cs:4679",
+                    "Toolbar self-test result",
+                    new Dictionary<string, object>
+                    {
+                        { "ok", failedSteps.Count == 0 },
+                        { "passedCount", passedSteps.Count },
+                        { "failedCount", failedSteps.Count },
+                        { "passed", passedSteps },
+                        { "failed", failedSteps }
+                    });
+
+                if (_runToolbarSelfTest && !IsDisposed)
+                {
+                    BeginInvoke(new Action(Close));
+                }
             }
         }
 
@@ -4318,11 +7672,110 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             }
             finally
             {
-                if (_runSplitSelfTest)
+                if (_runSplitSelfTest || _runPopoutPauseSelfTest || _runDualSelfTest || _runBigscreenGeometrySelfTest || _runStreamChatPanelSelfTest)
                 {
                     BeginInvoke(new Action(Close));
                 }
             }
+        }
+
+        private static int CoerceWebMessageInt(Dictionary<string, object> message, string key)
+        {
+            if (message == null || !message.ContainsKey(key))
+            {
+                return 0;
+            }
+
+            object raw = message[key];
+            if (raw == null)
+            {
+                return 0;
+            }
+
+            try
+            {
+                if (raw is int)
+                {
+                    return (int)raw;
+                }
+
+                if (raw is long)
+                {
+                    long int64 = (long)raw;
+                    if (int64 > int.MaxValue || int64 < int.MinValue)
+                    {
+                        return 0;
+                    }
+
+                    return (int)int64;
+                }
+
+                if (raw is double)
+                {
+                    double dbl = (double)raw;
+                    if (double.IsNaN(dbl) || double.IsInfinity(dbl))
+                    {
+                        return 0;
+                    }
+
+                    return (int)Math.Round(dbl);
+                }
+
+                if (raw is decimal)
+                {
+                    return (int)(decimal)raw;
+                }
+
+                string text = Convert.ToString(raw, CultureInfo.InvariantCulture);
+                int parsed;
+                if (int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out parsed))
+                {
+                    return parsed;
+                }
+            }
+            catch
+            {
+            }
+
+            return 0;
+        }
+
+        private static bool CoerceWebMessageBool(Dictionary<string, object> message, string key)
+        {
+            if (message == null || !message.ContainsKey(key))
+            {
+                return false;
+            }
+
+            object raw = message[key];
+            if (raw == null)
+            {
+                return false;
+            }
+
+            if (raw is bool)
+            {
+                return (bool)raw;
+            }
+
+            bool parsed;
+            if (bool.TryParse(Convert.ToString(raw, CultureInfo.InvariantCulture), out parsed))
+            {
+                return parsed;
+            }
+
+            return false;
+        }
+
+        private static int QuantizeLayoutPixel(int value)
+        {
+            if (value <= 0)
+            {
+                return 0;
+            }
+
+            const int step = 8;
+            return (value + step / 2) / step * step;
         }
 
         private void OnMainWebViewMessageReceived(object sender, CoreWebView2WebMessageReceivedEventArgs e)
@@ -4338,18 +7791,141 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 }
 
                 string type = Convert.ToString(message["type"]);
+                // #region agent log
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "N0",
+                    "DestinyChatDesktop.cs:5078",
+                    "Main web message received",
+                    new Dictionary<string, object>
+                    {
+                        { "type", type ?? string.Empty },
+                        { "source", _webView != null && _webView.Source != null ? _webView.Source.AbsoluteUri : string.Empty }
+                    });
+                // #endregion
 
                 if (string.Equals(type, "codex-snip-start", StringComparison.OrdinalIgnoreCase))
                 {
+                    string requestId = message.ContainsKey("requestId") ? Convert.ToString(message["requestId"]) : string.Empty;
+                    bool probe = false;
+                    if (message.ContainsKey("probe"))
+                    {
+                        object probeValue = message["probe"];
+                        if (probeValue is bool)
+                        {
+                            probe = (bool)probeValue;
+                        }
+                        else
+                        {
+                            bool.TryParse(Convert.ToString(probeValue), out probe);
+                        }
+                    }
+                    if (_treatSnipAsProbe)
+                    {
+                        probe = true;
+                    }
+                    DateTime nowUtc = DateTime.UtcNow;
+                    if (!string.IsNullOrWhiteSpace(requestId) &&
+                        string.Equals(requestId, _lastSnipRequestId, StringComparison.Ordinal) &&
+                        (nowUtc - _lastSnipRequestUtc).TotalSeconds < 6)
+                    {
+                        // #region agent log
+                        AgentDebugLog.Write(
+                            "pre-fix",
+                            "N1",
+                            "DestinyChatDesktop.cs:5080",
+                            "Snip duplicate request ignored",
+                            new Dictionary<string, object>
+                            {
+                                { "requestId", requestId }
+                            });
+                        // #endregion
+                        return;
+                    }
+                    _lastSnipRequestId = requestId ?? string.Empty;
+                    _lastSnipRequestUtc = nowUtc;
+                    // #region agent log
+                    AgentDebugLog.Write(
+                        "pre-fix",
+                        "N1",
+                        "DestinyChatDesktop.cs:5080",
+                        "Snip start message received",
+                        new Dictionary<string, object>
+                        {
+                            { "source", _webView != null && _webView.Source != null ? _webView.Source.AbsoluteUri : string.Empty },
+                            { "windowState", this.WindowState.ToString() },
+                            { "requestId", requestId ?? string.Empty },
+                            { "probe", probe }
+                        });
+                    // #endregion
+                    try
+                    {
+                        JavaScriptSerializer ackSerializer = new JavaScriptSerializer();
+                        _webView.CoreWebView2.PostWebMessageAsString(ackSerializer.Serialize(new Dictionary<string, object>
+                        {
+                            { "type", "codex-snip-ack" },
+                            { "requestId", requestId ?? string.Empty }
+                        }));
+                    }
+                    catch
+                    {
+                    }
                     // Debug: confirm C# received the message
                     _webView.CoreWebView2.ExecuteScriptAsync(
                         "document.getElementById('codex-snip-btn').style.outline='2px solid lime';");
+                    if (probe)
+                    {
+                        return;
+                    }
                     HandleSnipAndUploadAsync();
+                    return;
+                }
+
+                if (string.Equals(type, "codex-snip-debug", StringComparison.OrdinalIgnoreCase))
+                {
+                    // #region agent log
+                    AgentDebugLog.Write(
+                        "pre-fix",
+                        "N6",
+                        "DestinyChatDesktop.cs:5110",
+                        "Snip debug bridge message",
+                        new Dictionary<string, object>
+                        {
+                            { "stage", message.ContainsKey("stage") ? Convert.ToString(message["stage"]) : string.Empty },
+                            { "href", message.ContainsKey("href") ? Convert.ToString(message["href"]) : string.Empty },
+                            { "inIframe", message.ContainsKey("inIframe") ? Convert.ToString(message["inIframe"]) : string.Empty },
+                            { "hasHost", message.ContainsKey("hasHost") ? Convert.ToString(message["hasHost"]) : string.Empty },
+                            { "hasTopHost", message.ContainsKey("hasTopHost") ? Convert.ToString(message["hasTopHost"]) : string.Empty },
+                            { "sent", message.ContainsKey("sent") ? Convert.ToString(message["sent"]) : string.Empty },
+                            { "error", message.ContainsKey("error") ? Convert.ToString(message["error"]) : string.Empty }
+                        });
+                    // #endregion
                     return;
                 }
 
                 if (string.Equals(type, "codex-dual-chat-request", StringComparison.OrdinalIgnoreCase))
                 {
+                    return;
+                }
+
+                if (string.Equals(type, "embedsState", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (_suppressPageEmbedsState)
+                    {
+                        return;
+                    }
+
+                    ApplyEmbedsStateFromWebMessage(message);
+                    return;
+                }
+
+                if (string.Equals(type, "codex-stream-chat-request", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (_suppressPageEmbedsState)
+                    {
+                        return;
+                    }
+
                     NotifyDualChatSourceChanged();
                     return;
                 }
@@ -4387,13 +7963,137 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         }
                     }
 
-                    ApplyDualChatHostState(enabled, available, chatUrl, emptyMessage);
+                    if (_runSplitSelfTest || _runToolbarSelfTest)
+                    {
+                        // #region agent log
+                        AgentDebugLog.Write(
+                            "pre-fix",
+                            "B2",
+                            "DestinyChatDesktop.cs:4808",
+                            "Dual chat host state message",
+                            new Dictionary<string, object>
+                            {
+                                { "enabled", enabled },
+                                { "available", available },
+                                { "chatUrl", chatUrl ?? string.Empty },
+                                { "message", emptyMessage ?? string.Empty },
+                                { "currentPage", _webView.Source != null ? _webView.Source.AbsoluteUri : string.Empty }
+                            });
+                        // #endregion
+                    }
+
+                    return;
+                }
+
+                if (string.Equals(type, "codex-stream-chat-toggle", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (_suppressPageEmbedsState)
+                    {
+                        return;
+                    }
+
+                    bool enabled = false;
+                    if (message.ContainsKey("enabled"))
+                    {
+                        object enabledValue = message["enabled"];
+                        if (enabledValue is bool)
+                        {
+                            enabled = (bool)enabledValue;
+                        }
+                        else
+                        {
+                            bool.TryParse(Convert.ToString(enabledValue), out enabled);
+                        }
+                    }
+
+                    if (_runSplitSelfTest || _runToolbarSelfTest || _runDualSelfTest)
+                    {
+                        AgentDebugLog.Write(
+                            "pre-fix",
+                            "B3",
+                            "DestinyChatDesktop.cs:5250",
+                            "Stream chat toggle message",
+                            new Dictionary<string, object>
+                            {
+                                { "enabled", enabled },
+                                { "isBigscreenHostMode", IsBigscreenHostMode() },
+                                { "currentSource", _webView != null && _webView.Source != null ? _webView.Source.AbsoluteUri : string.Empty }
+                            });
+                    }
+
+                    _dualChatHostEnabled = enabled;
+                    if (!enabled)
+                    {
+                        _lastStreamChatSourceJson = null;
+                        ApplyDualChatHostState(false, false, string.Empty, string.Empty);
+                    }
+                    else
+                    {
+                        _lastStreamChatSourceJson = null;
+                        _lastDualChatLayoutFingerprint = null;
+                        NotifyDualChatSourceChanged();
+                    }
+
+                    return;
+                }
+
+                if (string.Equals(type, "codex-bigscreen-dual-toggle", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (_suppressPageEmbedsState)
+                    {
+                        return;
+                    }
+
+                    bool enabled = false;
+                    if (message.ContainsKey("enabled"))
+                    {
+                        object enabledValue = message["enabled"];
+                        if (enabledValue is bool)
+                        {
+                            enabled = (bool)enabledValue;
+                        }
+                        else
+                        {
+                            bool.TryParse(Convert.ToString(enabledValue), out enabled);
+                        }
+                    }
+
+                    if (_runSplitSelfTest || _runToolbarSelfTest || _runDualSelfTest)
+                    {
+                        AgentDebugLog.Write(
+                            "pre-fix",
+                            "B3",
+                            "DestinyChatDesktop.cs:5250",
+                            "Bigscreen dual toggle message",
+                            new Dictionary<string, object>
+                            {
+                                { "enabled", enabled },
+                                { "isBigscreenHostMode", IsBigscreenHostMode() },
+                                { "currentSource", _webView != null && _webView.Source != null ? _webView.Source.AbsoluteUri : string.Empty }
+                            });
+                    }
+
+                    _dualChatHostEnabled = enabled;
+                    if (!enabled)
+                    {
+                        ApplyDualChatHostState(false, false, string.Empty, string.Empty);
+                    }
+                    else
+                    {
+                        _lastStreamChatSourceJson = null;
+                        _lastDualChatLayoutFingerprint = null;
+                        NotifyDualChatSourceChanged();
+                    }
+
                     return;
                 }
 
                 if (string.Equals(type, "codex-bigscreen-layout", StringComparison.OrdinalIgnoreCase))
                 {
                     int chatTop = 0;
+                    int inputTop = 0;
+                    int viewportWidth = 0;
+                    int viewportHeight = 0;
                     if (message.ContainsKey("chatTop"))
                     {
                         object chatTopValue = message["chatTop"];
@@ -4407,19 +8107,6 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         }
                     }
 
-                    _bigscreenChatTopOffset = Math.Max(0, chatTop);
-                    LayoutDualChatPanel();
-                    return;
-                }
-
-                if (string.Equals(type, "codex-dual-chat-layout", StringComparison.OrdinalIgnoreCase))
-                {
-                    int inputTop = 0;
-                    int paneLeft = 0;
-                    int paneTop = 0;
-                    int paneWidth = 0;
-                    int paneHeight = 0;
-                    bool layoutActive = false;
                     if (message.ContainsKey("inputTop"))
                     {
                         object inputTopValue = message["inputTop"];
@@ -4433,77 +8120,194 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         }
                     }
 
-                    if (message.ContainsKey("paneLeft"))
+                    if (message.ContainsKey("windowWidth"))
                     {
-                        object paneLeftValue = message["paneLeft"];
-                        if (paneLeftValue is int)
+                        object widthValue = message["windowWidth"];
+                        if (widthValue is int)
                         {
-                            paneLeft = (int)paneLeftValue;
+                            viewportWidth = (int)widthValue;
                         }
                         else
                         {
-                            int.TryParse(Convert.ToString(paneLeftValue), out paneLeft);
+                            int.TryParse(Convert.ToString(widthValue), out viewportWidth);
                         }
                     }
 
-                    if (message.ContainsKey("paneTop"))
+                    if (message.ContainsKey("windowHeight"))
                     {
-                        object paneTopValue = message["paneTop"];
-                        if (paneTopValue is int)
+                        object heightValue = message["windowHeight"];
+                        if (heightValue is int)
                         {
-                            paneTop = (int)paneTopValue;
+                            viewportHeight = (int)heightValue;
                         }
                         else
                         {
-                            int.TryParse(Convert.ToString(paneTopValue), out paneTop);
+                            int.TryParse(Convert.ToString(heightValue), out viewportHeight);
                         }
                     }
 
-                    if (message.ContainsKey("paneWidth"))
+                    _bigscreenChatTopOffset = Math.Max(0, chatTop);
+                    if (viewportWidth > 0)
                     {
-                        object paneWidthValue = message["paneWidth"];
-                        if (paneWidthValue is int)
-                        {
-                            paneWidth = (int)paneWidthValue;
-                        }
-                        else
-                        {
-                            int.TryParse(Convert.ToString(paneWidthValue), out paneWidth);
-                        }
+                        _bigscreenViewportWidth = viewportWidth;
                     }
-
-                    if (message.ContainsKey("paneHeight"))
+                    if (viewportHeight > 0)
                     {
-                        object paneHeightValue = message["paneHeight"];
-                        if (paneHeightValue is int)
-                        {
-                            paneHeight = (int)paneHeightValue;
-                        }
-                        else
-                        {
-                            int.TryParse(Convert.ToString(paneHeightValue), out paneHeight);
-                        }
+                        _bigscreenViewportHeight = viewportHeight;
                     }
-
-                    if (message.ContainsKey("layoutActive"))
+                    if (inputTop > 0)
                     {
-                        object layoutActiveValue = message["layoutActive"];
-                        if (layoutActiveValue is bool)
+                        _dualChatInputTop = Math.Max(0, inputTop);
+                    }
+
+                    if (_runToolbarSelfTest || _runSplitSelfTest || _runBigscreenGeometrySelfTest || _runDualSelfTest)
+                    {
+                        // #region agent log
+                        AgentDebugLog.Write(
+                            "pre-fix",
+                            "C1",
+                            "DestinyChatDesktop.cs:4909",
+                            "Bigscreen layout message",
+                            new Dictionary<string, object>
+                            {
+                                { "chatTop", _bigscreenChatTopOffset },
+                                { "inputTop", _dualChatInputTop },
+                                { "windowWidth", _bigscreenViewportWidth },
+                                { "windowHeight", _bigscreenViewportHeight },
+                                { "currentPage", _webView.Source != null ? _webView.Source.AbsoluteUri : string.Empty }
+                            });
+                        // #endregion
+                    }
+                    LayoutDualChatPanel();
+                    return;
+                }
+
+                if (string.Equals(type, "codex-bigscreen-layout-debug", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (_runToolbarSelfTest || _runSplitSelfTest)
+                    {
+                        string raw = serializer.Serialize(message);
+                        // #region agent log
+                        AgentDebugLog.Write(
+                            "pre-fix",
+                            "C2",
+                            "DestinyChatDesktop.cs:4927",
+                            "Bigscreen layout debug",
+                            new Dictionary<string, object>
+                            {
+                                { "payload", raw ?? string.Empty }
+                            });
+                        // #endregion
+                    }
+                    return;
+                }
+
+                if (string.Equals(type, "codex-bigscreen-media-state", StringComparison.OrdinalIgnoreCase))
+                {
+                    string raw = serializer.Serialize(message);
+                    string activeStreamUrl = ExtractActiveStreamPlayerUrlFromBigscreenMediaState(message);
+                    if (!string.IsNullOrWhiteSpace(activeStreamUrl) &&
+                        !string.Equals(_activeStreamPlayerUrl ?? string.Empty, activeStreamUrl, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _activeStreamPlayerUrl = activeStreamUrl;
+                        _lastStreamChatSourceJson = null;
+                        if (_dualChatHostEnabled)
                         {
-                            layoutActive = (bool)layoutActiveValue;
-                        }
-                        else
-                        {
-                            bool.TryParse(Convert.ToString(layoutActiveValue), out layoutActive);
+                            NotifyDualChatSourceChanged();
                         }
                     }
 
-                    _dualChatInputTop = Math.Max(0, inputTop);
+                    // #region agent log
+                    AgentDebugLog.Write(
+                        "pre-fix",
+                        "M1",
+                        "DestinyChatDesktop.cs:4950",
+                        "Bigscreen media state",
+                        new Dictionary<string, object>
+                        {
+                            { "payload", raw ?? string.Empty },
+                            { "currentPage", _webView.Source != null ? _webView.Source.AbsoluteUri : string.Empty }
+                        });
+                    // #endregion
+                    return;
+                }
+
+                if (string.Equals(type, "codex-dual-chat-layout", StringComparison.OrdinalIgnoreCase))
+                {
+                    int inputTop = CoerceWebMessageInt(message, "inputTop");
+                    int paneLeft = CoerceWebMessageInt(message, "paneLeft");
+                    int paneTop = CoerceWebMessageInt(message, "paneTop");
+                    int paneWidth = CoerceWebMessageInt(message, "paneWidth");
+                    int paneHeight = CoerceWebMessageInt(message, "paneHeight");
+                    int windowWidth = CoerceWebMessageInt(message, "windowWidth");
+                    int windowHeight = CoerceWebMessageInt(message, "windowHeight");
+                    bool layoutActive = CoerceWebMessageBool(message, "layoutActive");
+
+                    string layoutFingerprint = string.Format(
+                        CultureInfo.InvariantCulture,
+                        "{0}|{1}|{2}|{3}|{4}|{5}",
+                        QuantizeLayoutPixel(inputTop),
+                        QuantizeLayoutPixel(paneLeft),
+                        QuantizeLayoutPixel(paneTop),
+                        QuantizeLayoutPixel(paneWidth),
+                        QuantizeLayoutPixel(paneHeight),
+                        layoutActive ? 1 : 0);
+                    if (!string.IsNullOrEmpty(_lastDualChatLayoutFingerprint) &&
+                        string.Equals(layoutFingerprint, _lastDualChatLayoutFingerprint, StringComparison.Ordinal))
+                    {
+                        return;
+                    }
+
+                    _lastDualChatLayoutFingerprint = layoutFingerprint;
+
+                    if (IsBigscreenPage())
+                    {
+                        if (inputTop > 0)
+                        {
+                            _dualChatInputTop = Math.Max(0, inputTop);
+                        }
+                    }
+                    else
+                    {
+                        _dualChatInputTop = Math.Max(0, inputTop);
+                    }
+                    if (!IsBigscreenPage())
+                    {
+                        if (windowWidth > 0)
+                        {
+                            _embedChatLayoutViewportWidth = windowWidth;
+                        }
+
+                        if (windowHeight > 0)
+                        {
+                            _embedChatLayoutViewportHeight = windowHeight;
+                        }
+                    }
                     _dualChatPaneLeft = Math.Max(0, paneLeft);
                     _dualChatPaneTop = Math.Max(0, paneTop);
                     _dualChatPaneWidth = Math.Max(0, paneWidth);
                     _dualChatPaneHeight = Math.Max(0, paneHeight);
                     _dualChatLayoutActive = layoutActive;
+                    if (_runSplitSelfTest || _runToolbarSelfTest)
+                    {
+                        // #region agent log
+                        AgentDebugLog.Write(
+                            "pre-fix",
+                            "B3",
+                            "DestinyChatDesktop.cs:4956",
+                            "Dual chat layout message",
+                            new Dictionary<string, object>
+                            {
+                                { "inputTop", _dualChatInputTop },
+                                { "paneLeft", _dualChatPaneLeft },
+                                { "paneTop", _dualChatPaneTop },
+                                { "paneWidth", _dualChatPaneWidth },
+                                { "paneHeight", _dualChatPaneHeight },
+                                { "layoutActive", _dualChatLayoutActive },
+                                { "isBigscreenPage", IsBigscreenPage() }
+                            });
+                        // #endregion
+                    }
                     LayoutDualChatPanel();
                     return;
                 }
@@ -4517,6 +8321,13 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 {
                     return;
                 }
+
+                AgentDebugLog.Write(
+                    "post-fix",
+                    "S1",
+                    "DestinyChatDesktop.cs:5215",
+                    "Split self-test result",
+                    message);
 
                 WriteSplitSelfTestResult(serializer.Serialize(message));
             }
@@ -4538,115 +8349,240 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
         private async void HandleSnipAndUploadAsync()
         {
-            // Minimize the window so the full screen is visible for snipping
-            this.Invoke((Action)(() => { this.WindowState = FormWindowState.Minimized; }));
-
-            // Wait for minimize animation, then send the hotkey
-            await System.Threading.Tasks.Task.Delay(400);
-
-            // Clear clipboard so we can detect when a new snip lands
-            this.Invoke((Action)(() => { try { Clipboard.Clear(); } catch { } }));
-
-            // Send Win+Shift+S — system-level hotkey that triggers the snip overlay
-            // on all Windows 10/11 machines regardless of which snip app is installed.
-            // The snip overlay auto-copies the selection to clipboard on completion.
-            SendSnipHotkey();
-
-            // Poll clipboard for up to 45 seconds for a new image
-            System.Drawing.Image snip = null;
-            for (int i = 0; i < 225; i++)
-            {
-                await System.Threading.Tasks.Task.Delay(200);
-                this.Invoke((Action)(() =>
-                {
-                    try { if (Clipboard.ContainsImage()) snip = Clipboard.GetImage(); } catch { }
-                }));
-                if (snip != null) break;
-            }
-
-            // Restore window regardless of outcome
-            this.Invoke((Action)(() => { this.WindowState = FormWindowState.Normal; }));
-
-            if (snip == null)
-            {
-                PostSnipResult(null, "timeout");
-                return;
-            }
-
-            // Encode image as PNG bytes
-            byte[] pngBytes;
             try
             {
-                using (MemoryStream ms = new MemoryStream())
+                bool wasFullScreen = _isFullScreen;
+                // #region agent log
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "N2",
+                    "DestinyChatDesktop.cs:5444",
+                    "Handle snip start",
+                    new Dictionary<string, object>
+                    {
+                        { "windowStateBefore", this.WindowState.ToString() },
+                        { "wasFullScreen", wasFullScreen }
+                    });
+                // #endregion
+
+                if (wasFullScreen)
                 {
-                    snip.Save(ms, System.Drawing.Imaging.ImageFormat.Png);
-                    pngBytes = ms.ToArray();
-                }
-            }
-            catch
-            {
-                PostSnipResult(null, "encode");
-                return;
-            }
-
-            // Upload to femboy.beauty as multipart/form-data
-            string uploadedUrl = null;
-            try
-            {
-                string boundary = "DestinyChatBoundary" + Guid.NewGuid().ToString("N");
-                byte[] headerBytes = Encoding.UTF8.GetBytes(
-                    "--" + boundary + "\r\n" +
-                    "Content-Disposition: form-data; name=\"file\"; filename=\"snip.png\"\r\n" +
-                    "Content-Type: image/png\r\n\r\n");
-                byte[] footerBytes = Encoding.UTF8.GetBytes("\r\n--" + boundary + "--\r\n");
-
-                byte[] body = new byte[headerBytes.Length + pngBytes.Length + footerBytes.Length];
-                Buffer.BlockCopy(headerBytes, 0, body, 0, headerBytes.Length);
-                Buffer.BlockCopy(pngBytes, 0, body, headerBytes.Length, pngBytes.Length);
-                Buffer.BlockCopy(footerBytes, 0, body, headerBytes.Length + pngBytes.Length, footerBytes.Length);
-
-                HttpWebRequest req = (HttpWebRequest)WebRequest.Create("https://femboy.beauty/api/upload");
-                req.Method = "POST";
-                req.ContentType = "multipart/form-data; boundary=" + boundary;
-                req.ContentLength = body.Length;
-
-                using (Stream stream = await req.GetRequestStreamAsync())
-                {
-                    await stream.WriteAsync(body, 0, body.Length);
+                    this.Invoke((Action)(() =>
+                    {
+                        try
+                        {
+                            ToggleFullScreen();
+                        }
+                        catch
+                        {
+                        }
+                    }));
+                    await System.Threading.Tasks.Task.Delay(180);
                 }
 
-                using (WebResponse resp = await req.GetResponseAsync())
-                using (StreamReader reader = new StreamReader(resp.GetResponseStream()))
+                // Keep the app visible and trigger snip overlay directly.
+                await System.Threading.Tasks.Task.Delay(120);
+
+                // Clear clipboard so we can detect when a new snip lands
+                this.Invoke((Action)(() => { try { Clipboard.Clear(); } catch { } }));
+
+                // Send Win+Shift+S — system-level hotkey that triggers the snip overlay
+                // on all Windows 10/11 machines regardless of which snip app is installed.
+                // The snip overlay auto-copies the selection to clipboard on completion.
+                SendSnipHotkey();
+
+                // #region agent log
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "N2",
+                    "DestinyChatDesktop.cs:5458",
+                    "Snip hotkey sent",
+                    new Dictionary<string, object>
+                    {
+                        { "windowStateAfterHotkey", this.WindowState.ToString() },
+                        { "wasFullScreen", wasFullScreen }
+                    });
+                // #endregion
+
+                // Poll clipboard for up to 45 seconds for a new image
+                System.Drawing.Image snip = null;
+                int pollCount = 0;
+                for (int i = 0; i < 225; i++)
                 {
-                    string json = await reader.ReadToEndAsync();
-                    JavaScriptSerializer ser = new JavaScriptSerializer();
-                    Dictionary<string, object> dict = ser.DeserializeObject(json) as Dictionary<string, object>;
-                    if (dict != null && dict.ContainsKey("link"))
-                        uploadedUrl = Convert.ToString(dict["link"]);
+                    await System.Threading.Tasks.Task.Delay(200);
+                    pollCount = i + 1;
+                    this.Invoke((Action)(() =>
+                    {
+                        try { if (Clipboard.ContainsImage()) snip = Clipboard.GetImage(); } catch { }
+                    }));
+                    if (snip != null) break;
                 }
-            }
-            catch { }
 
-            if (string.IsNullOrEmpty(uploadedUrl))
+                // #region agent log
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "N3",
+                    "DestinyChatDesktop.cs:5475",
+                    "Snip clipboard poll finished",
+                    new Dictionary<string, object>
+                    {
+                        { "pollCount", pollCount },
+                        { "hasImage", snip != null }
+                    });
+                // #endregion
+
+                if (snip == null)
+                {
+                    PostSnipResult(null, "timeout");
+                    return;
+                }
+
+                // Encode image as PNG bytes
+                byte[] pngBytes;
+                try
+                {
+                    using (MemoryStream ms = new MemoryStream())
+                    {
+                        snip.Save(ms, System.Drawing.Imaging.ImageFormat.Png);
+                        pngBytes = ms.ToArray();
+                    }
+                }
+                catch
+                {
+                    PostSnipResult(null, "encode");
+                    return;
+                }
+
+                // Upload to femboy.beauty as multipart/form-data
+                string uploadedUrl = null;
+                try
+                {
+                    string boundary = "DestinyChatBoundary" + Guid.NewGuid().ToString("N");
+                    byte[] headerBytes = Encoding.UTF8.GetBytes(
+                        "--" + boundary + "\r\n" +
+                        "Content-Disposition: form-data; name=\"file\"; filename=\"snip.png\"\r\n" +
+                        "Content-Type: image/png\r\n\r\n");
+                    byte[] footerBytes = Encoding.UTF8.GetBytes("\r\n--" + boundary + "--\r\n");
+
+                    byte[] body = new byte[headerBytes.Length + pngBytes.Length + footerBytes.Length];
+                    Buffer.BlockCopy(headerBytes, 0, body, 0, headerBytes.Length);
+                    Buffer.BlockCopy(pngBytes, 0, body, headerBytes.Length, pngBytes.Length);
+                    Buffer.BlockCopy(footerBytes, 0, body, headerBytes.Length + pngBytes.Length, footerBytes.Length);
+
+                    HttpWebRequest req = (HttpWebRequest)WebRequest.Create("https://femboy.beauty/api/upload");
+                    req.Method = "POST";
+                    req.ContentType = "multipart/form-data; boundary=" + boundary;
+                    req.ContentLength = body.Length;
+
+                    using (Stream stream = await req.GetRequestStreamAsync())
+                    {
+                        await stream.WriteAsync(body, 0, body.Length);
+                    }
+
+                    using (WebResponse resp = await req.GetResponseAsync())
+                    using (StreamReader reader = new StreamReader(resp.GetResponseStream()))
+                    {
+                        string json = await reader.ReadToEndAsync();
+                        JavaScriptSerializer ser = new JavaScriptSerializer();
+                        Dictionary<string, object> dict = ser.DeserializeObject(json) as Dictionary<string, object>;
+                        if (dict != null && dict.ContainsKey("link"))
+                            uploadedUrl = Convert.ToString(dict["link"]);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // #region agent log
+                    AgentDebugLog.Write(
+                        "pre-fix",
+                        "N4",
+                        "DestinyChatDesktop.cs:5534",
+                        "Snip upload failed",
+                        new Dictionary<string, object>
+                        {
+                            { "error", ex.Message }
+                        });
+                    // #endregion
+                }
+
+                // #region agent log
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "N4",
+                    "DestinyChatDesktop.cs:5550",
+                    "Snip upload finished",
+                    new Dictionary<string, object>
+                    {
+                        { "hasUploadedUrl", !string.IsNullOrEmpty(uploadedUrl) }
+                    });
+                // #endregion
+
+                if (string.IsNullOrEmpty(uploadedUrl))
+                {
+                    PostSnipResult(null, "upload");
+                    return;
+                }
+
+                PostSnipResult(uploadedUrl, null);
+            }
+            catch (Exception ex)
             {
-                PostSnipResult(null, "upload");
-                return;
+                // #region agent log
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "N2",
+                    "DestinyChatDesktop.cs:5444",
+                    "Handle snip failed unexpectedly",
+                    new Dictionary<string, object>
+                    {
+                        { "error", ex.Message }
+                    });
+                // #endregion
+                PostSnipResult(null, "exception");
             }
-
-            PostSnipResult(uploadedUrl, null);
         }
 
         private void PostSnipResult(string url, string error)
         {
             try
             {
+                // #region agent log
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "N5",
+                    "DestinyChatDesktop.cs:5557",
+                    "Posting snip result to webview",
+                    new Dictionary<string, object>
+                    {
+                        { "hasUrl", !string.IsNullOrEmpty(url) },
+                        { "error", error ?? string.Empty }
+                    });
+                // #endregion
                 System.Diagnostics.Debug.WriteLine("[Snip] PostSnipResult url=" + url + " error=" + error);
                 string urlJson = url == null ? "null" : "\"" + url.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
                 string errJson = error == null ? "null" : "\"" + error.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
-                _webView.CoreWebView2.PostWebMessageAsString(
-                    "{\"type\":\"codex-snip-done\",\"url\":" + urlJson + ",\"error\":" + errJson + "}");
+                string payload = "{\"type\":\"codex-snip-done\",\"url\":" + urlJson + ",\"error\":" + errJson + "}";
+                _webView.CoreWebView2.PostWebMessageAsString(payload);
+                if (_bigscreenBarView != null && _bigscreenBarView.CoreWebView2 != null)
+                {
+                    _bigscreenBarView.CoreWebView2.PostWebMessageAsString(payload);
+                }
+                _webView.CoreWebView2.ExecuteScriptAsync(
+                    "(function(){try{const msg={type:'codex-snip-done',url:" + urlJson + ",error:" + errJson + "};window.postMessage(msg,'*');const frames=document.querySelectorAll('iframe');for(let i=0;i<frames.length;i++){try{frames[i].contentWindow&&frames[i].contentWindow.postMessage(msg,'*');}catch(_){}}}catch(_){}})();");
             }
-            catch { }
+            catch (Exception ex)
+            {
+                // #region agent log
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "N5",
+                    "DestinyChatDesktop.cs:4870",
+                    "Snip result post failed",
+                    new Dictionary<string, object>
+                    {
+                        { "error", ex.Message }
+                    });
+                // #endregion
+            }
         }
 
         private void OnHistoryChanged(object sender, object e)
@@ -4684,6 +8620,165 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             }
         }
 
+        private void OnDualChatNavigationStarting(object sender, CoreWebView2NavigationStartingEventArgs e)
+        {
+            // #region agent log
+            AgentDebugLog.Write(
+                "pre-fix",
+                "K1",
+                "DestinyChatDesktop.cs:5332",
+                "Dual chat navigation starting",
+                new Dictionary<string, object>
+                {
+                    { "uri", e != null ? e.Uri ?? string.Empty : string.Empty },
+                    { "hostEnabled", _dualChatHostEnabled },
+                    { "hostAvailable", _dualChatHostAvailable },
+                    { "panelVisible", _dualChatPanel != null && _dualChatPanel.Visible },
+                    { "viewVisible", _dualChatView != null && _dualChatView.Visible }
+                });
+            // #endregion
+        }
+
+        private async void OnDualChatNavigationCompleted(object sender, CoreWebView2NavigationCompletedEventArgs e)
+        {
+            _dualChatNavigationInFlight = false;
+
+            string source = string.Empty;
+            if (_dualChatView != null && _dualChatView.Source != null)
+            {
+                source = _dualChatView.Source.AbsoluteUri;
+            }
+
+            // #region agent log
+            AgentDebugLog.Write(
+                "pre-fix",
+                "K2",
+                "DestinyChatDesktop.cs:5365",
+                "Dual chat navigation completed",
+                new Dictionary<string, object>
+                {
+                    { "isSuccess", e != null && e.IsSuccess },
+                    { "webErrorStatus", e != null ? e.WebErrorStatus.ToString() : string.Empty },
+                    { "source", source },
+                    { "requestedUrl", _dualChatRequestedUrl ?? string.Empty }
+                });
+            // #endregion
+
+            if (_dualChatView == null || _dualChatView.CoreWebView2 == null)
+            {
+                return;
+            }
+
+            await ProbeDualChatDomAsync("completed");
+            await System.Threading.Tasks.Task.Delay(400);
+            await ProbeDualChatDomAsync("completed+400ms");
+            await System.Threading.Tasks.Task.Delay(400);
+            await ProbeDualChatDomAsync("completed+800ms");
+        }
+
+        private static async System.Threading.Tasks.Task<string> ExecuteWebViewScriptWithTimeoutAsync(
+            CoreWebView2 core,
+            string script,
+            int timeoutMs)
+        {
+            if (core == null)
+            {
+                return null;
+            }
+
+            System.Threading.Tasks.Task<string> scriptTask = core.ExecuteScriptAsync(script);
+            System.Threading.Tasks.Task winner = await System.Threading.Tasks.Task.WhenAny(
+                scriptTask,
+                System.Threading.Tasks.Task.Delay(timeoutMs)).ConfigureAwait(true);
+            if (winner != scriptTask)
+            {
+                return null;
+            }
+
+            return await scriptTask.ConfigureAwait(true);
+        }
+
+        private async System.Threading.Tasks.Task ProbeDualChatDomAsync(string stage)
+        {
+            if (_dualChatView == null || _dualChatView.CoreWebView2 == null)
+            {
+                return;
+            }
+
+            string source = string.Empty;
+            if (_dualChatView.Source != null)
+            {
+                source = _dualChatView.Source.AbsoluteUri;
+            }
+
+            try
+            {
+                const int probeScriptTimeoutMs = 10000;
+                string probe = await ExecuteWebViewScriptWithTimeoutAsync(
+                    _dualChatView.CoreWebView2,
+                    @"
+                    (() => {
+                        const body = document.body;
+                        const messageCandidates = document.querySelectorAll('[class*=""chat""], [class*=""message""], [id*=""chat""], [id*=""message""]');
+                        const inputCandidates = document.querySelectorAll('textarea, input[type=""text""], [contenteditable=""true""]');
+                        const title = document.title || '';
+                        const href = location.href || '';
+                        const ready = document.readyState || '';
+                        const bodyPointerEvents = body ? getComputedStyle(body).pointerEvents : '';
+                        const bodyOverflow = body ? getComputedStyle(body).overflow : '';
+                        const htmlOverflow = document.documentElement ? getComputedStyle(document.documentElement).overflow : '';
+                        const iframeCount = document.querySelectorAll('iframe').length;
+                        const disabledCount = document.querySelectorAll('[disabled], [aria-disabled=""true""]').length;
+                        const bodyText = body && body.innerText ? body.innerText.trim().slice(0, 220) : '';
+                        return JSON.stringify({
+                            href: href,
+                            title: title,
+                            ready: ready,
+                            bodyPointerEvents: bodyPointerEvents,
+                            bodyOverflow: bodyOverflow,
+                            htmlOverflow: htmlOverflow,
+                            messageCandidateCount: messageCandidates.length,
+                            inputCandidateCount: inputCandidates.length,
+                            iframeCount: iframeCount,
+                            disabledCount: disabledCount,
+                            bodyText: bodyText
+                        });
+                    })();
+                ",
+                    probeScriptTimeoutMs);
+
+                // #region agent log
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "K3",
+                    "DestinyChatDesktop.cs:5402",
+                    "Dual chat DOM probe",
+                    new Dictionary<string, object>
+                    {
+                        { "stage", stage ?? string.Empty },
+                        { "result", probe ?? string.Empty },
+                        { "source", source }
+                    });
+                // #endregion
+            }
+            catch (Exception ex)
+            {
+                // #region agent log
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "K4",
+                    "DestinyChatDesktop.cs:5417",
+                    "Dual chat DOM probe failed",
+                    new Dictionary<string, object>
+                    {
+                        { "stage", stage ?? string.Empty },
+                        { "error", ex.Message },
+                        { "source", source }
+                    });
+                // #endregion
+            }
+        }
+
         private void OnMainFormResize(object sender, EventArgs e)
         {
             LayoutDualChatPanel();
@@ -4691,9 +8786,10 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
         private void LayoutDualChatPanel()
         {
-            bool shouldShow = _dualChatHostEnabled && (IsChatPage() || IsBigscreenPage());
+            bool shouldShow = _dualChatHostEnabled && (IsChatPage() || IsBigscreenHostMode());
             if (!shouldShow)
             {
+                _dualChatPanel.Bounds = Rectangle.Empty;
                 _dualChatPanel.Visible = false;
                 return;
             }
@@ -4704,33 +8800,133 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             int width = Math.Max(320, (webViewBounds.Width - 14) / 2);
             int height = Math.Max(0, bottom - top);
             int left = webViewBounds.Right - width;
-
-            if (IsChatPage())
+            bool hasReportedPaneBounds = _dualChatPaneWidth > 0 && _dualChatPaneHeight > 0;
+            bool hasReportedInputTop = _dualChatInputTop > 0;
+            bool hasAnyUsableBounds = IsBigscreenPage()
+                ? (hasReportedPaneBounds || _bigscreenChatTopOffset > 0)
+                : (hasReportedPaneBounds || hasReportedInputTop);
+            if (!hasAnyUsableBounds)
             {
-                if (!_dualChatLayoutActive || _dualChatPaneWidth <= 0 || _dualChatPaneHeight <= 0)
+                _dualChatPanel.Bounds = Rectangle.Empty;
+                _dualChatPanel.Visible = false;
+                return;
+            }
+
+            double zoomFactor = _browserReady ? ClampZoom(_webView.ZoomFactor) : ClampZoom(_state.ZoomFactor);
+            double pixelScaleX = zoomFactor;
+            double pixelScaleY = zoomFactor;
+
+            if (IsBigscreenPage())
+            {
+                if (_bigscreenViewportWidth > 0)
                 {
-                    _dualChatPanel.Visible = false;
-                    return;
+                    pixelScaleX = (double)webViewBounds.Width / _bigscreenViewportWidth;
                 }
 
-                double zoomFactor = _browserReady ? ClampZoom(_webView.ZoomFactor) : ClampZoom(_state.ZoomFactor);
-                left = webViewBounds.Left + (int)Math.Round(_dualChatPaneLeft * zoomFactor);
-                top = webViewBounds.Top + (int)Math.Round(_dualChatPaneTop * zoomFactor);
-                width = Math.Max(0, (int)Math.Round(_dualChatPaneWidth * zoomFactor));
-                height = Math.Max(0, (int)Math.Round(_dualChatPaneHeight * zoomFactor));
+                if (_bigscreenViewportHeight > 0)
+                {
+                    pixelScaleY = (double)webViewBounds.Height / _bigscreenViewportHeight;
+                }
             }
-            else if (IsBigscreenPage())
+
+            if (IsBigscreenPage())
             {
-                int fullHeight = bottom - top;
-                int cappedHeight = (int)Math.Round(fullHeight * 0.60);
-                top = bottom - cappedHeight;
-                height = Math.Max(0, bottom - top);
-                left = webViewBounds.Right - width;
+                if (hasReportedPaneBounds)
+                {
+                    left = webViewBounds.Left + (int)Math.Round(_dualChatPaneLeft * pixelScaleX);
+                    width = Math.Max(0, (int)Math.Round(_dualChatPaneWidth * pixelScaleX));
+                }
+
+                if (_bigscreenChatTopOffset > 0)
+                {
+                    top = webViewBounds.Top + (int)Math.Round(_bigscreenChatTopOffset * pixelScaleY);
+                    top = Math.Max(webViewBounds.Top, Math.Min(webViewBounds.Bottom, top));
+                }
+
+                height = Math.Max(0, webViewBounds.Bottom - top);
+            }
+            else if (hasReportedPaneBounds)
+            {
+                double scaleX = zoomFactor;
+                double scaleY = zoomFactor;
+                if (_embedChatLayoutViewportWidth > 0)
+                {
+                    scaleX = (double)webViewBounds.Width / _embedChatLayoutViewportWidth;
+                }
+
+                if (_embedChatLayoutViewportHeight > 0)
+                {
+                    scaleY = (double)webViewBounds.Height / _embedChatLayoutViewportHeight;
+                }
+
+                left = webViewBounds.Left + (int)Math.Round(_dualChatPaneLeft * scaleX);
+                top = webViewBounds.Top + (int)Math.Round(_dualChatPaneTop * scaleY);
+                width = Math.Max(0, (int)Math.Round(_dualChatPaneWidth * scaleX));
+                height = Math.Max(0, (int)Math.Round(_dualChatPaneHeight * scaleY));
             }
 
             _dualChatPanel.Bounds = new Rectangle(left, top, width, height);
-            _dualChatPanel.Visible = height > 0;
+            Rectangle clampedBounds = _dualChatPanel.Bounds;
+            int minLeft = webViewBounds.Left;
+            int maxRight = webViewBounds.Right;
+            int minTop = webViewBounds.Top;
+            int maxBottom = webViewBounds.Bottom;
+
+            if (hasReportedInputTop && !IsBigscreenPage())
+            {
+                double inputScaleY = zoomFactor;
+                if (_embedChatLayoutViewportHeight > 0)
+                {
+                    inputScaleY = (double)webViewBounds.Height / _embedChatLayoutViewportHeight;
+                }
+
+                int inputTop = webViewBounds.Top + (int)Math.Round(_dualChatInputTop * inputScaleY);
+                maxBottom = Math.Min(maxBottom, inputTop);
+            }
+
+            clampedBounds.X = Math.Max(minLeft, Math.Min(clampedBounds.X, maxRight));
+            clampedBounds.Y = Math.Max(minTop, Math.Min(clampedBounds.Y, maxBottom));
+            clampedBounds.Width = Math.Max(0, Math.Min(clampedBounds.Width, maxRight - clampedBounds.X));
+            clampedBounds.Height = Math.Max(0, Math.Min(clampedBounds.Height, maxBottom - clampedBounds.Y));
+            _dualChatPanel.Bounds = clampedBounds;
+            _dualChatPanel.Visible = _dualChatPanel.Bounds.Height > 0 && _dualChatPanel.Bounds.Width > 0;
             _dualChatPanel.BringToFront();
+            if (_runSplitSelfTest || _runToolbarSelfTest)
+            {
+                // #region agent log
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "B1",
+                    "DestinyChatDesktop.cs:5234",
+                    "Dual chat panel bounds applied",
+                    new Dictionary<string, object>
+                    {
+                        { "webViewLeft", webViewBounds.Left },
+                        { "webViewTop", webViewBounds.Top },
+                        { "webViewWidth", webViewBounds.Width },
+                        { "webViewHeight", webViewBounds.Height },
+                        { "panelLeft", _dualChatPanel.Bounds.Left },
+                        { "panelTop", _dualChatPanel.Bounds.Top },
+                        { "panelWidth", _dualChatPanel.Bounds.Width },
+                        { "panelHeight", _dualChatPanel.Bounds.Height },
+                        { "layoutActive", _dualChatLayoutActive },
+                        { "reportedPaneLeft", _dualChatPaneLeft },
+                        { "reportedPaneTop", _dualChatPaneTop },
+                        { "reportedPaneWidth", _dualChatPaneWidth },
+                        { "reportedPaneHeight", _dualChatPaneHeight },
+                        { "reportedInputTop", _dualChatInputTop },
+                        { "reportedWindowWidth", _bigscreenViewportWidth },
+                        { "reportedWindowHeight", _bigscreenViewportHeight },
+                        { "pixelScaleX", pixelScaleX },
+                        { "pixelScaleY", pixelScaleY },
+                        { "dualChatZIndex", Controls.GetChildIndex(_dualChatPanel) },
+                        { "mainWebViewZIndex", Controls.GetChildIndex(_webView) },
+                        { "dualChatPanelEnabled", _dualChatPanel.Enabled },
+                        { "dualChatViewEnabled", _dualChatView.Enabled },
+                        { "zoomFactor", zoomFactor }
+                    });
+                // #endregion
+            }
 
             if (_bigscreenBarPanel.Visible)
             {
@@ -4756,66 +8952,354 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 ? "No live stream chat is available for the current stream selection."
                 : emptyMessage.Trim();
 
+            ApplyBigscreenExternalChatLayout(enabled && IsBigscreenPage());
+
             if (!_browserReady || _dualChatView.CoreWebView2 == null)
             {
                 LayoutDualChatPanel();
                 return;
             }
 
-            if (!_dualChatHostEnabled || (!IsChatPage() && !IsBigscreenPage()))
+            if (!enabled || (!IsChatPage() && !IsBigscreenHostMode()))
             {
-                if (!IsChatPage())
-                {
-                    _dualChatInputTop = 0;
-                    _dualChatPaneLeft = 0;
-                    _dualChatPaneTop = 0;
-                    _dualChatPaneWidth = 0;
-                    _dualChatPaneHeight = 0;
-                    _dualChatLayoutActive = false;
-                }
+                _lastStreamChatSourceJson = null;
+                _lastDualChatLayoutFingerprint = null;
+                _activeStreamPlayerUrl = null;
+                _dualChatInputTop = 0;
+                _dualChatPaneLeft = 0;
+                _dualChatPaneTop = 0;
+                _dualChatPaneWidth = 0;
+                _dualChatPaneHeight = 0;
+                _dualChatLayoutActive = false;
+                _embedChatLayoutViewportWidth = 0;
+                _embedChatLayoutViewportHeight = 0;
                 _dualChatPanel.Visible = false;
                 _dualChatView.Visible = false;
                 _dualChatEmptyLabel.Visible = false;
-                _dualChatRequestedUrl = null;
-
-                if (_dualChatView.Source == null || !_dualChatView.Source.AbsoluteUri.Equals("about:blank", StringComparison.OrdinalIgnoreCase))
-                {
-                    _dualChatView.CoreWebView2.Navigate("about:blank");
-                }
-
+                NavigateDualChatViewIfNeeded("about:blank");
                 return;
             }
 
             LayoutDualChatPanel();
-            _dualChatPanel.Visible = true;
+            _dualChatPanel.Visible = _dualChatPanel.Bounds.Width > 0 && _dualChatPanel.Bounds.Height > 0;
 
-            if (_dualChatHostAvailable && !string.IsNullOrWhiteSpace(chatUrl))
+            if (available && !string.IsNullOrWhiteSpace(chatUrl))
             {
-                bool requestedUrlChanged = !string.Equals(_dualChatRequestedUrl, chatUrl, StringComparison.OrdinalIgnoreCase);
-                bool needsInitialNavigation = _dualChatView.Source == null ||
-                    string.IsNullOrWhiteSpace(_dualChatView.Source.AbsoluteUri) ||
-                    _dualChatView.Source.AbsoluteUri.Equals("about:blank", StringComparison.OrdinalIgnoreCase);
-
-                _dualChatRequestedUrl = chatUrl;
+                string streamNavUri = NormalizeKickStreamChatNavigationUrl(chatUrl);
                 _dualChatEmptyLabel.Visible = false;
                 _dualChatView.Visible = true;
-
-                if (requestedUrlChanged || needsInitialNavigation)
-                {
-                    _dualChatView.CoreWebView2.Navigate(chatUrl);
-                }
+                _dualChatEmptyLabel.SendToBack();
+                _dualChatView.BringToFront();
+                NavigateDualChatViewIfNeeded(streamNavUri);
             }
             else
             {
-                _dualChatRequestedUrl = null;
                 _dualChatView.Visible = false;
                 _dualChatEmptyLabel.Text = _dualChatEmptyMessage;
                 _dualChatEmptyLabel.Visible = true;
+                _dualChatEmptyLabel.BringToFront();
+                NavigateDualChatViewIfNeeded("about:blank");
+            }
+        }
 
-                if (_dualChatView.Source == null || !_dualChatView.Source.AbsoluteUri.Equals("about:blank", StringComparison.OrdinalIgnoreCase))
+        private void ResetChatLayoutForModeSwitch()
+        {
+            _lastStreamChatSourceJson = null;
+            _lastDualChatLayoutFingerprint = null;
+            _dualChatInputTop = 0;
+            _dualChatPaneLeft = 0;
+            _dualChatPaneTop = 0;
+            _dualChatPaneWidth = 0;
+            _dualChatPaneHeight = 0;
+            _dualChatLayoutActive = false;
+            _embedChatLayoutViewportWidth = 0;
+            _embedChatLayoutViewportHeight = 0;
+
+            ApplyDualChatHostState(false, false, string.Empty, string.Empty);
+            ResetInjectedChatLayoutForModeSwitch();
+            LayoutDualChatPanel();
+        }
+
+        private async void ResetInjectedChatLayoutForModeSwitch()
+        {
+            if (!_browserReady || _webView == null || _webView.CoreWebView2 == null)
+            {
+                return;
+            }
+
+            try
+            {
+                await _webView.CoreWebView2.ExecuteScriptAsync(@"
+                    (() => {
+                        function removeInlineLayout(el) {
+                            if (!el || !el.style) return;
+                            for (const prop of ['display','width','min-width','max-width','height','min-height','max-height','margin','padding','border','overflow','flex','left','right']) {
+                                try { el.style.removeProperty(prop); } catch (error) {}
+                            }
+                        }
+
+                        function resetDoc(doc) {
+                            if (!doc || !doc.body) return;
+
+                            try {
+                                doc.dispatchEvent(new CustomEvent('codex:dualchat-set', { detail: { enabled: false } }));
+                                doc.dispatchEvent(new CustomEvent('codex:split-set', { detail: { enabled: false } }));
+                            } catch (error) {}
+
+                            try {
+                                doc.body.classList.remove(
+                                    'codex-dual-chat-enabled',
+                                    'codex-split-chat-enabled',
+                                    'codex-bigscreen-dual-single-chat',
+                                    'codex-desktop-external-chat-active',
+                                    'codex-bigscreen-chat-below-media'
+                                );
+                            } catch (error) {}
+
+                            try {
+                                const root = doc.documentElement;
+                                if (root) {
+                                    root.style.removeProperty('--codex-dual-chat-bottom-offset');
+                                    root.style.removeProperty('--codex-chat-below-media-push');
+                                }
+                            } catch (error) {}
+
+                            try {
+                                for (const btn of doc.querySelectorAll('#codex-stream-chat-btn,#codex-dual-stream-chat-btn,#codex-split-chat-btn')) {
+                                    btn.classList.remove('codex-split-chat-active');
+                                }
+                            } catch (error) {}
+
+                            try {
+                                const dualPane = doc.getElementById('codex-dual-stream-pane');
+                                if (dualPane) {
+                                    dualPane.classList.remove('enabled', 'empty', 'codex-dual-chat-host-guest', 'codex-dual-stream-pane--bigscreen-fixed');
+                                    const frame = dualPane.querySelector('iframe');
+                                    if (frame) frame.setAttribute('src', 'about:blank');
+                                }
+                            } catch (error) {}
+
+                            try {
+                                const splitOverlay = doc.getElementById('codex-split-chat-overlay');
+                                if (splitOverlay) splitOverlay.classList.remove('enabled');
+                            } catch (error) {}
+
+                            try {
+                                for (const el of doc.querySelectorAll('.codex-bigscreen-dual-hide-target,.codex-bigscreen-dual-hide-sibling,#chat-wrap,.chat-wrap,#chat-output-frame,.chat-output-frame')) {
+                                    el.classList.remove('codex-bigscreen-dual-hide-target', 'codex-bigscreen-dual-hide-sibling');
+                                    removeInlineLayout(el);
+                                }
+                            } catch (error) {}
+                        }
+
+                        resetDoc(document);
+                        for (const frame of Array.from(document.querySelectorAll('iframe'))) {
+                            try {
+                                if (frame.contentDocument) resetDoc(frame.contentDocument);
+                            } catch (error) {}
+                        }
+                    })();
+                ");
+            }
+            catch
+            {
+                // The page may already be navigating; the native host state was still reset.
+            }
+        }
+
+        private void NavigateDualChatViewIfNeeded(string targetUri)
+        {
+            if (_dualChatView == null || _dualChatView.CoreWebView2 == null || string.IsNullOrWhiteSpace(targetUri))
+            {
+                return;
+            }
+
+            string currentUri = _dualChatView.Source != null ? _dualChatView.Source.AbsoluteUri : string.Empty;
+            if (StreamChatNavTargetsEqual(currentUri, targetUri))
+            {
+                _dualChatRequestedUrl = targetUri;
+                _dualChatNavigationInFlight = false;
+                return;
+            }
+
+            if (_dualChatNavigationInFlight && StreamChatNavTargetsEqual(_dualChatRequestedUrl, targetUri))
+            {
+                return;
+            }
+
+            _dualChatRequestedUrl = targetUri;
+            _dualChatNavigationInFlight = true;
+            _dualChatView.CoreWebView2.Navigate(targetUri);
+        }
+
+        private bool TryForceBigscreenEmbedRoute()
+        {
+            if (_webView == null || _webView.Source == null)
+            {
+                return false;
+            }
+
+            Uri currentSource = _webView.Source;
+            if (!currentSource.AbsolutePath.StartsWith("/bigscreen", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            bool hasStreamFragment = !string.IsNullOrWhiteSpace(currentSource.Fragment) && currentSource.Fragment.Length > 1;
+            if (hasStreamFragment)
+            {
+                return false;
+            }
+
+            BigscreenEmbedState selectedEmbed = GetSelectedBigscreenEmbed();
+            if (selectedEmbed == null || string.IsNullOrWhiteSpace(selectedEmbed.Url))
+            {
+                return false;
+            }
+
+            Uri selectedUri;
+            if (!TryBuildUri(selectedEmbed.Url, out selectedUri))
+            {
+                return false;
+            }
+
+            if (string.Equals(currentSource.AbsoluteUri, selectedUri.AbsoluteUri, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            // #region agent log
+            AgentDebugLog.Write(
+                "pre-fix",
+                "M2",
+                "DestinyChatDesktop.cs:5690",
+                "Force bigscreen route to selected stream",
+                new Dictionary<string, object>
                 {
-                    _dualChatView.CoreWebView2.Navigate("about:blank");
+                    { "currentSource", currentSource.AbsoluteUri },
+                    { "selectedSource", selectedUri.AbsoluteUri }
+                });
+            // #endregion
+
+            NavigateToUrl(selectedUri.AbsoluteUri);
+            return true;
+        }
+
+        private async void ApplyBigscreenExternalChatLayout(bool enabled)
+        {
+            if (!_browserReady || _webView.CoreWebView2 == null)
+            {
+                return;
+            }
+
+            try
+            {
+                string script = @"
+                    (() => {
+                        const styleId = 'codex-desktop-external-chat-style';
+                        const active = " + (enabled ? "true" : "false") + @";
+                        const cssText = `
+                                body.codex-desktop-external-chat-active #chat-wrap,
+                                body.codex-desktop-external-chat-active .chat-wrap {
+                                    width: calc((100% - 14px) / 2) !important;
+                                    max-width: calc((100% - 14px) / 2) !important;
+                                    box-sizing: border-box !important;
+                                    overflow: hidden !important;
+                                }
+                                body.codex-desktop-external-chat-active #chat-output-frame,
+                                body.codex-desktop-external-chat-active .chat-output-frame {
+                                    width: 100% !important;
+                                    max-width: 100% !important;
+                                    box-sizing: border-box !important;
+                                }
+                                body.codex-desktop-external-chat-active #chat-input-frame,
+                                body.codex-desktop-external-chat-active #chat-input-wrap,
+                                body.codex-desktop-external-chat-active #chat-input-control,
+                                body.codex-desktop-external-chat-active #chat-tools-wrap,
+                                body.codex-desktop-external-chat-active .chat-tools-group {
+                                    width: calc((100% - 14px) / 2) !important;
+                                    max-width: calc((100% - 14px) / 2) !important;
+                                    box-sizing: border-box !important;
+                                }
+                            `;
+
+                        function applyToDoc(doc, activeState) {
+                            if (!doc || !doc.body) {
+                                return false;
+                            }
+
+                            let style = doc.getElementById(styleId);
+                            if (!style && doc.head) {
+                                style = doc.createElement('style');
+                                style.id = styleId;
+                                style.textContent = cssText;
+                                doc.head.appendChild(style);
+                            } else if (style && style.textContent !== cssText) {
+                                style.textContent = cssText;
+                            }
+
+                            doc.body.classList.toggle('codex-desktop-external-chat-active', !!activeState);
+                            return !!(doc.querySelector('#chat-wrap') || doc.querySelector('.chat-wrap'));
+                        }
+
+                        function removeFromDoc(doc) {
+                            if (doc && doc.body) {
+                                doc.body.classList.remove('codex-desktop-external-chat-active');
+                            }
+                        }
+
+                        let appliedToEmbeddedChat = false;
+                        for (const frame of Array.from(document.querySelectorAll('iframe'))) {
+                            const src = String(frame && (frame.getAttribute('src') || frame.src || '') || '').toLowerCase();
+                            if (src.indexOf('/embed/chat') < 0) {
+                                continue;
+                            }
+
+                            try {
+                                const rect = frame.getBoundingClientRect();
+                                const topWidth = Math.round(window.innerWidth || document.documentElement.clientWidth || 0);
+                                const expectedHalf = topWidth > 0 ? Math.round((topWidth - 14) / 2) : 0;
+                                const tolerance = Math.max(24, Math.round(topWidth * 0.04));
+                                const needsInnerCollapse = active && (!expectedHalf || Math.round(rect.width || 0) > expectedHalf + tolerance);
+                                if (frame.contentDocument && applyToDoc(frame.contentDocument, needsInnerCollapse)) {
+                                    appliedToEmbeddedChat = true;
+                                }
+                            } catch (error) {
+                            }
+                        }
+
+                        const appliedToTop = applyToDoc(document, active && !appliedToEmbeddedChat);
+                        if (appliedToEmbeddedChat) {
+                            removeFromDoc(document);
+                        }
+
+                        return JSON.stringify({
+                            appliedToEmbeddedChat: appliedToEmbeddedChat,
+                            appliedToTop: appliedToTop,
+                            active: active
+                        });
+                    })();
+                ";
+                string result = await _webView.CoreWebView2.ExecuteScriptAsync(script);
+                if (_runToolbarSelfTest || _runSplitSelfTest)
+                {
+                    // #region agent log
+                    AgentDebugLog.Write(
+                        "post-fix",
+                        "C3",
+                        "DestinyChatDesktop.cs:5410",
+                        "Applied bigscreen external chat layout",
+                        new Dictionary<string, object>
+                        {
+                            { "enabled", enabled },
+                            { "scriptResult", result ?? string.Empty },
+                            { "currentPage", _webView.Source != null ? _webView.Source.AbsoluteUri : string.Empty }
+                        });
+                    // #endregion
                 }
+            }
+            catch
+            {
             }
         }
 
@@ -4858,18 +9342,451 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 }
 
                 string url = message.ContainsKey("url") ? Convert.ToString(message["url"]) : string.Empty;
+                string platform = message.ContainsKey("platform") ? Convert.ToString(message["platform"]) : string.Empty;
+                string mediaId = message.ContainsKey("mediaId") ? Convert.ToString(message["mediaId"]) : string.Empty;
                 if (string.IsNullOrWhiteSpace(url))
                 {
                     return;
                 }
 
-                NavigateToUrl(url);
+                if (IsChatPage())
+                {
+                    _preferredChatEmbedUrl = url.Trim();
+                    SelectStreamChatEmbedFromTopBar(url, platform, mediaId);
+                    NotifyDualChatSourceChanged();
+                    return;
+                }
+
+                _preferredChatEmbedUrl = url.Trim();
+                string targetUrl = ResolveBigscreenSelectionUrl(url, platform, mediaId);
+                if (string.IsNullOrWhiteSpace(targetUrl))
+                {
+                    targetUrl = BigscreenBarUrl;
+                }
+
+                NavigateToUrl(targetUrl);
                 SetStatus("Opened bigscreen selection. Click Chat to return to chat-only view.");
             }
             catch
             {
                 // Ignore malformed page messages.
             }
+        }
+
+        private void SelectStreamChatEmbedFromTopBar(string url, string platform, string mediaId)
+        {
+            if (string.IsNullOrWhiteSpace(url))
+            {
+                return;
+            }
+
+            string platformTrim = platform != null ? platform.Trim() : string.Empty;
+            string mediaIdTrim = mediaId != null ? mediaId.Trim() : string.Empty;
+            if (_webView == null || _webView.CoreWebView2 == null)
+            {
+                ApplyChatModeEmbedsSelectionFallback(url, platformTrim, mediaIdTrim);
+                return;
+            }
+
+            JavaScriptSerializer serializer = new JavaScriptSerializer();
+            string urlLit = serializer.Serialize(url.Trim());
+            string platformLit = serializer.Serialize(platformTrim);
+            string mediaIdLit = serializer.Serialize(mediaIdTrim);
+            string script = @"
+                (() => {
+                    const targetUrl = " + urlLit + @";
+                    const platform = " + platformLit + @";
+                    const mediaId = " + mediaIdLit + @";
+                    function norm(x) {
+                        if (!x) {
+                            return '';
+                        }
+                        try {
+                            return new URL(x, window.location.href).href;
+                        } catch (e) {
+                            return (x + '').trim();
+                        }
+                    }
+                    const nTarget = norm(targetUrl);
+                    const nodes = document.querySelectorAll(
+                        '#chat-panel-embeds a.embed-link, .chat-embeds a.embed-link, #embeds-panel a.embed-link');
+                    for (let i = 0; i < nodes.length; i++) {
+                        const a = nodes[i];
+                        const href = norm(a.getAttribute('href') || '');
+                        if (nTarget && href && href === nTarget) {
+                            a.click();
+                            return true;
+                        }
+                        if (platform && mediaId) {
+                            const dp = (a.getAttribute('data-platform') || '').trim();
+                            const did = (a.getAttribute('data-id') || a.getAttribute('data-mediaid') || '').trim();
+                            if (dp === platform && did === mediaId) {
+                                a.click();
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                })()";
+
+            RunSelectStreamChatEmbedFromTopBarAsync(script, url, platformTrim, mediaIdTrim);
+        }
+
+        private async void RunSelectStreamChatEmbedFromTopBarAsync(
+            string script,
+            string url,
+            string platformTrim,
+            string mediaIdTrim)
+        {
+            try
+            {
+                string result = await _webView.CoreWebView2.ExecuteScriptAsync(script);
+                string trimmed = (result ?? string.Empty).Trim();
+                if (string.Equals(trimmed, "true", StringComparison.OrdinalIgnoreCase))
+                {
+                    SetStatus("Stream chat source updated.");
+                    return;
+                }
+            }
+            catch
+            {
+            }
+
+            ApplyChatModeEmbedsSelectionFallback(url, platformTrim, mediaIdTrim);
+            SetStatus("Stream chat source updated.");
+        }
+
+        private void ApplyChatModeEmbedsSelectionFallback(string url, string platformTrim, string mediaIdTrim)
+        {
+            if (_latestBigscreenEmbeds == null || _latestBigscreenEmbeds.Count == 0)
+            {
+                return;
+            }
+
+            bool found = false;
+            bool selectedAssigned = false;
+            List<object> items = new List<object>();
+            foreach (BigscreenEmbedState embed in _latestBigscreenEmbeds)
+            {
+                if (embed == null || string.IsNullOrWhiteSpace(embed.Url))
+                {
+                    continue;
+                }
+
+                bool isSelected = !selectedAssigned && EmbedFromTopBarClickMatchesState(embed, url, platformTrim, mediaIdTrim);
+                if (isSelected)
+                {
+                    found = true;
+                    selectedAssigned = true;
+                }
+
+                items.Add(new Dictionary<string, object>
+                {
+                    { "url", embed.Url },
+                    { "platform", embed.Platform ?? string.Empty },
+                    { "mediaId", embed.MediaId ?? string.Empty },
+                    { "text", embed.DisplayText ?? string.Empty },
+                    { "title", embed.TooltipText ?? string.Empty },
+                    { "selected", isSelected }
+                });
+            }
+
+            if (!found)
+            {
+                return;
+            }
+
+            Dictionary<string, object> message = new Dictionary<string, object>
+            {
+                { "items", items.ToArray() }
+            };
+
+            if (!string.IsNullOrWhiteSpace(_activeStreamPlayerUrl))
+            {
+                message["activeStreamUrl"] = _activeStreamPlayerUrl;
+            }
+
+            ApplyEmbedsStateFromWebMessage(message);
+        }
+
+        private static bool EmbedFromTopBarClickMatchesState(
+            BigscreenEmbedState embed,
+            string clickUrl,
+            string platformTrim,
+            string mediaIdTrim)
+        {
+            if (embed == null)
+            {
+                return false;
+            }
+
+            if (!string.IsNullOrWhiteSpace(clickUrl) &&
+                string.Equals((embed.Url ?? string.Empty).Trim(), clickUrl.Trim(), StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            if (!string.IsNullOrWhiteSpace(platformTrim) && !string.IsNullOrWhiteSpace(mediaIdTrim))
+            {
+                return string.Equals((embed.Platform ?? string.Empty).Trim(), platformTrim, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals((embed.MediaId ?? string.Empty).Trim(), mediaIdTrim, StringComparison.OrdinalIgnoreCase);
+            }
+
+            return false;
+        }
+
+        private static bool AreBigscreenEmbedStatesEqual(BigscreenEmbedState a, BigscreenEmbedState b)
+        {
+            if (ReferenceEquals(a, b))
+            {
+                return true;
+            }
+
+            if (a == null || b == null)
+            {
+                return a == null && b == null;
+            }
+
+            return string.Equals(a.Url ?? string.Empty, b.Url ?? string.Empty, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(a.Platform ?? string.Empty, b.Platform ?? string.Empty, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(a.MediaId ?? string.Empty, b.MediaId ?? string.Empty, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(a.DisplayText ?? string.Empty, b.DisplayText ?? string.Empty, StringComparison.Ordinal)
+                && string.Equals(a.TooltipText ?? string.Empty, b.TooltipText ?? string.Empty, StringComparison.Ordinal)
+                && a.IsSelected == b.IsSelected;
+        }
+
+        private static bool AreBigscreenEmbedListsEqual(List<BigscreenEmbedState> a, List<BigscreenEmbedState> b)
+        {
+            if (ReferenceEquals(a, b))
+            {
+                return true;
+            }
+
+            if (a == null || b == null)
+            {
+                return a == null && b == null;
+            }
+
+            if (a.Count != b.Count)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < a.Count; i++)
+            {
+                if (!AreBigscreenEmbedStatesEqual(a[i], b[i]))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private static bool StreamChatNavTargetsEqual(string currentUri, string targetUri)
+        {
+            if (string.IsNullOrWhiteSpace(targetUri))
+            {
+                return string.IsNullOrWhiteSpace(currentUri);
+            }
+
+            if (string.IsNullOrWhiteSpace(currentUri))
+            {
+                return false;
+            }
+
+            Uri current;
+            Uri target;
+            if (!Uri.TryCreate(currentUri.Trim(), UriKind.Absolute, out current) ||
+                !Uri.TryCreate(targetUri.Trim(), UriKind.Absolute, out target))
+            {
+                return string.Equals(currentUri.Trim(), targetUri.Trim(), StringComparison.OrdinalIgnoreCase);
+            }
+
+            string hostCur = (current.IdnHost ?? string.Empty).ToLowerInvariant();
+            string hostTgt = (target.IdnHost ?? string.Empty).ToLowerInvariant();
+            if (hostCur.StartsWith("www.", StringComparison.Ordinal))
+            {
+                hostCur = hostCur.Substring(4);
+            }
+
+            if (hostTgt.StartsWith("www.", StringComparison.Ordinal))
+            {
+                hostTgt = hostTgt.Substring(4);
+            }
+
+            return string.Equals(current.Scheme, target.Scheme, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(hostCur, hostTgt, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(
+                    current.AbsolutePath.TrimEnd('/'),
+                    target.AbsolutePath.TrimEnd('/'),
+                    StringComparison.OrdinalIgnoreCase)
+                && string.Equals(current.Query ?? string.Empty, target.Query ?? string.Empty, StringComparison.Ordinal);
+        }
+
+        private void ApplyEmbedsStateFromWebMessage(Dictionary<string, object> message)
+        {
+            if (message == null)
+            {
+                return;
+            }
+
+            string activeStreamUrl = string.Empty;
+            if (message.ContainsKey("activeStreamUrl"))
+            {
+                activeStreamUrl = (Convert.ToString(message["activeStreamUrl"]) ?? string.Empty).Trim();
+            }
+
+            List<BigscreenEmbedState> embeds = new List<BigscreenEmbedState>();
+            List<object> itemObjects = new List<object>();
+            if (message.ContainsKey("items"))
+            {
+                object rawItems = message["items"];
+                object[] arr = rawItems as object[];
+                if (arr != null)
+                {
+                    itemObjects.AddRange(arr);
+                }
+                else
+                {
+                    System.Collections.ArrayList list = rawItems as System.Collections.ArrayList;
+                    if (list != null)
+                    {
+                        foreach (object entry in list)
+                        {
+                            itemObjects.Add(entry);
+                        }
+                    }
+                    else
+                    {
+                        System.Collections.IEnumerable enumerable = rawItems as System.Collections.IEnumerable;
+                        if (enumerable != null && !(rawItems is string))
+                        {
+                            foreach (object entry in enumerable)
+                            {
+                                itemObjects.Add(entry);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (itemObjects.Count > 0)
+            {
+                foreach (object item in itemObjects)
+                {
+                    Dictionary<string, object> values = item as Dictionary<string, object>;
+                    if (values == null)
+                    {
+                        System.Collections.Hashtable table = item as System.Collections.Hashtable;
+                        if (table == null)
+                        {
+                            continue;
+                        }
+
+                        values = new Dictionary<string, object>();
+                        foreach (System.Collections.DictionaryEntry entry in table)
+                        {
+                            values[Convert.ToString(entry.Key)] = entry.Value;
+                        }
+                    }
+
+                    string url = values.ContainsKey("url") ? Convert.ToString(values["url"]) : string.Empty;
+                    if (string.IsNullOrWhiteSpace(url))
+                    {
+                        continue;
+                    }
+
+                    bool isSelected = false;
+                    if (values.ContainsKey("selected"))
+                    {
+                        object selectedValue = values["selected"];
+                        if (selectedValue is bool)
+                        {
+                            isSelected = (bool)selectedValue;
+                        }
+                        else
+                        {
+                            bool.TryParse(Convert.ToString(selectedValue), out isSelected);
+                        }
+                    }
+
+                    embeds.Add(new BigscreenEmbedState
+                    {
+                        Url = url,
+                        Platform = values.ContainsKey("platform") ? Convert.ToString(values["platform"]) : string.Empty,
+                        MediaId = values.ContainsKey("mediaId") ? Convert.ToString(values["mediaId"]) : string.Empty,
+                        DisplayText = values.ContainsKey("text") ? Convert.ToString(values["text"]) : string.Empty,
+                        TooltipText = values.ContainsKey("title") ? Convert.ToString(values["title"]) : string.Empty,
+                        IsSelected = isSelected
+                    });
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(_preferredChatEmbedUrl))
+            {
+                bool matched = false;
+                foreach (BigscreenEmbedState embed in embeds)
+                {
+                    if (embed == null || string.IsNullOrWhiteSpace(embed.Url))
+                    {
+                        continue;
+                    }
+
+                    bool isPreferred = string.Equals(embed.Url.Trim(), _preferredChatEmbedUrl, StringComparison.OrdinalIgnoreCase);
+                    embed.IsSelected = isPreferred;
+                    if (isPreferred)
+                    {
+                        matched = true;
+                    }
+                }
+
+                if (!matched)
+                {
+                    _preferredChatEmbedUrl = null;
+                }
+            }
+
+            if (AreBigscreenEmbedListsEqual(_latestBigscreenEmbeds, embeds) &&
+                string.Equals(
+                    _activeStreamPlayerUrl ?? string.Empty,
+                    activeStreamUrl ?? string.Empty,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            _activeStreamPlayerUrl = activeStreamUrl;
+            _latestBigscreenEmbeds = embeds;
+            if (_runSplitSelfTest || _runToolbarSelfTest)
+            {
+                BigscreenEmbedState selectedEmbed = null;
+                foreach (BigscreenEmbedState embed in embeds)
+                {
+                    if (embed != null && embed.IsSelected)
+                    {
+                        selectedEmbed = embed;
+                        break;
+                    }
+                }
+
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "B2",
+                    "DestinyChatDesktop.cs:ApplyEmbedsStateFromWebMessage",
+                    "Embeds state message",
+                    new Dictionary<string, object>
+                    {
+                        { "embedCount", embeds.Count },
+                        { "selectedUrl", selectedEmbed != null ? (selectedEmbed.Url ?? string.Empty) : string.Empty },
+                        { "selectedPlatform", selectedEmbed != null ? (selectedEmbed.Platform ?? string.Empty) : string.Empty },
+                        { "selectedMediaId", selectedEmbed != null ? (selectedEmbed.MediaId ?? string.Empty) : string.Empty },
+                        { "selectedText", selectedEmbed != null ? (selectedEmbed.DisplayText ?? string.Empty) : string.Empty }
+                    });
+            }
+
+            UpdateBigscreenEmbeds(embeds);
+            NotifyDualChatSourceChanged();
         }
 
         private void OnBigscreenBarWebMessageReceived(object sender, CoreWebView2WebMessageReceivedEventArgs e)
@@ -4885,58 +9802,36 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 }
 
                 string messageType = Convert.ToString(message["type"]);
+                if (string.Equals(messageType, "codex-snip-start", StringComparison.OrdinalIgnoreCase))
+                {
+                    HandleSnipAndUploadAsync();
+                    return;
+                }
+                if (string.Equals(messageType, "codex-snip-debug", StringComparison.OrdinalIgnoreCase))
+                {
+                    AgentDebugLog.Write(
+                        "pre-fix",
+                        "N6",
+                        "DestinyChatDesktop.cs:6483",
+                        "Snip debug from bigscreen bar",
+                        new Dictionary<string, object>
+                        {
+                            { "stage", message.ContainsKey("stage") ? Convert.ToString(message["stage"]) : string.Empty },
+                            { "href", message.ContainsKey("href") ? Convert.ToString(message["href"]) : string.Empty },
+                            { "inIframe", message.ContainsKey("inIframe") ? Convert.ToString(message["inIframe"]) : string.Empty },
+                            { "hasHost", message.ContainsKey("hasHost") ? Convert.ToString(message["hasHost"]) : string.Empty },
+                            { "hasTopHost", message.ContainsKey("hasTopHost") ? Convert.ToString(message["hasTopHost"]) : string.Empty },
+                            { "sent", message.ContainsKey("sent") ? Convert.ToString(message["sent"]) : string.Empty },
+                            { "error", message.ContainsKey("error") ? Convert.ToString(message["error"]) : string.Empty }
+                        });
+                    return;
+                }
                 if (!string.Equals(messageType, "embedsState", StringComparison.OrdinalIgnoreCase))
                 {
                     return;
                 }
 
-                List<BigscreenEmbedState> embeds = new List<BigscreenEmbedState>();
-                object[] items = message.ContainsKey("items") ? message["items"] as object[] : null;
-                if (items != null)
-                {
-                    foreach (object item in items)
-                    {
-                        Dictionary<string, object> values = item as Dictionary<string, object>;
-                        if (values == null)
-                        {
-                            continue;
-                        }
-
-                        string url = values.ContainsKey("url") ? Convert.ToString(values["url"]) : string.Empty;
-                        if (string.IsNullOrWhiteSpace(url))
-                        {
-                            continue;
-                        }
-
-                        bool isSelected = false;
-                        if (values.ContainsKey("selected"))
-                        {
-                            object selectedValue = values["selected"];
-                            if (selectedValue is bool)
-                            {
-                                isSelected = (bool)selectedValue;
-                            }
-                            else
-                            {
-                                bool.TryParse(Convert.ToString(selectedValue), out isSelected);
-                            }
-                        }
-
-                        embeds.Add(new BigscreenEmbedState
-                        {
-                            Url = url,
-                            Platform = values.ContainsKey("platform") ? Convert.ToString(values["platform"]) : string.Empty,
-                            MediaId = values.ContainsKey("mediaId") ? Convert.ToString(values["mediaId"]) : string.Empty,
-                            DisplayText = values.ContainsKey("text") ? Convert.ToString(values["text"]) : string.Empty,
-                            TooltipText = values.ContainsKey("title") ? Convert.ToString(values["title"]) : string.Empty,
-                            IsSelected = isSelected
-                        });
-                    }
-                }
-
-                _latestBigscreenEmbeds = embeds;
-                UpdateBigscreenEmbeds(embeds);
-                NotifyDualChatSourceChanged();
+                ApplyEmbedsStateFromWebMessage(message);
             }
             catch
             {
@@ -5041,6 +9936,11 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
         private void NotifyDualChatSourceChanged()
         {
+            if (_suppressPageEmbedsState)
+            {
+                return;
+            }
+
             if (!_browserReady || _webView.CoreWebView2 == null)
             {
                 return;
@@ -5049,39 +9949,30 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             try
             {
                 Dictionary<string, object> payload = BuildDualChatSourcePayload();
+                payload["type"] = "codex-stream-chat-source";
 
-                // On bigscreen, auto-enable dual chat host since there is no JS UI to toggle it.
-                // On chat page, only apply host state when the user has explicitly enabled it.
-                if (_dualChatHostEnabled || IsBigscreenPage())
+                bool available = payload.ContainsKey("available") && Convert.ToBoolean(payload["available"]);
+                string chatUrl = payload.ContainsKey("chatUrl") ? Convert.ToString(payload["chatUrl"]) : string.Empty;
+                string emptyMessage = payload.ContainsKey("reason") && !available
+                    ? "No live stream chat is available for the current stream selection."
+                    : string.Empty;
+
+                JavaScriptSerializer serializer = new JavaScriptSerializer();
+                string outboundJson = serializer.Serialize(payload);
+
+                if (_dualChatHostEnabled)
                 {
-                    bool available = false;
-                    if (payload.ContainsKey("available"))
-                    {
-                        object availableValue = payload["available"];
-                        if (availableValue is bool)
-                        {
-                            available = (bool)availableValue;
-                        }
-                        else
-                        {
-                            bool.TryParse(Convert.ToString(availableValue), out available);
-                        }
-                    }
-
-                    string chatUrl = payload.ContainsKey("chatUrl") ? Convert.ToString(payload["chatUrl"]) : string.Empty;
-                    string emptyMessage = payload.ContainsKey("reason") && !available
-                        ? "No live stream chat is available for the current stream selection."
-                        : string.Empty;
                     ApplyDualChatHostState(true, available, chatUrl, emptyMessage);
                 }
 
-                if (!IsChatPage())
+                if (!string.IsNullOrEmpty(_lastStreamChatSourceJson) &&
+                    string.Equals(outboundJson, _lastStreamChatSourceJson, StringComparison.Ordinal))
                 {
                     return;
                 }
 
-                JavaScriptSerializer serializer = new JavaScriptSerializer();
-                _webView.CoreWebView2.PostWebMessageAsJson(serializer.Serialize(payload));
+                _lastStreamChatSourceJson = outboundJson;
+                _webView.CoreWebView2.PostWebMessageAsJson(outboundJson);
             }
             catch
             {
@@ -5094,17 +9985,18 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             Dictionary<string, object> payload = new Dictionary<string, object>
             {
                 { "type", "codex-dual-chat-source" },
-                { "available", false }
+                { "available", false },
+                { "hostBigscreenMode", IsBigscreenHostMode() }
             };
 
-            BigscreenEmbedState selectedEmbed = NormalizeBigscreenEmbedState(GetSelectedBigscreenEmbed());
+            BigscreenEmbedState selectedEmbed = NormalizeBigscreenEmbedState(GetStreamChatEmbed());
             if (selectedEmbed == null)
             {
                 payload["reason"] = "no-selection";
                 return payload;
             }
 
-            string chatUrl = BuildStreamChatUrl(selectedEmbed);
+            string chatUrl = BuildStreamChatUrl(selectedEmbed, false);
             string platform = string.IsNullOrWhiteSpace(selectedEmbed.Platform)
                 ? string.Empty
                 : selectedEmbed.Platform.Trim().ToLowerInvariant();
@@ -5117,12 +10009,118 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             if (string.IsNullOrWhiteSpace(chatUrl))
             {
                 payload["reason"] = "unsupported";
+                if (_runSplitSelfTest || _runToolbarSelfTest)
+                {
+                    // #region agent log
+                    AgentDebugLog.Write(
+                        "pre-fix",
+                        "B2",
+                        "DestinyChatDesktop.cs:5730",
+                        "Dual chat source payload unsupported",
+                        new Dictionary<string, object>
+                        {
+                            { "selectedUrl", selectedEmbed.Url ?? string.Empty },
+                            { "selectedPlatform", selectedEmbed.Platform ?? string.Empty },
+                            { "selectedMediaId", selectedEmbed.MediaId ?? string.Empty },
+                            { "currentSource", _webView.Source != null ? _webView.Source.AbsoluteUri : string.Empty }
+                        });
+                    // #endregion
+                }
                 return payload;
             }
 
             payload["available"] = true;
-            payload["chatUrl"] = chatUrl;
+            payload["chatUrl"] = NormalizeKickStreamChatNavigationUrl(chatUrl);
+            if (_runSplitSelfTest || _runToolbarSelfTest)
+            {
+                // #region agent log
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "B2",
+                    "DestinyChatDesktop.cs:5736",
+                    "Dual chat source payload",
+                    new Dictionary<string, object>
+                    {
+                        { "selectedUrl", selectedEmbed.Url ?? string.Empty },
+                        { "selectedPlatform", selectedEmbed.Platform ?? string.Empty },
+                        { "selectedMediaId", selectedEmbed.MediaId ?? string.Empty },
+                        { "chatUrl", chatUrl ?? string.Empty },
+                        { "currentSource", _webView.Source != null ? _webView.Source.AbsoluteUri : string.Empty }
+                    });
+                // #endregion
+            }
             return payload;
+        }
+
+        private static string ExtractActiveStreamPlayerUrlFromBigscreenMediaState(Dictionary<string, object> message)
+        {
+            if (message == null || !message.ContainsKey("iframePreview"))
+            {
+                return string.Empty;
+            }
+
+            List<object> frames = new List<object>();
+            object rawFrames = message["iframePreview"];
+            object[] arr = rawFrames as object[];
+            if (arr != null)
+            {
+                frames.AddRange(arr);
+            }
+            else
+            {
+                System.Collections.ArrayList list = rawFrames as System.Collections.ArrayList;
+                if (list != null)
+                {
+                    foreach (object entry in list)
+                    {
+                        frames.Add(entry);
+                    }
+                }
+            }
+
+            for (int i = 0; i < frames.Count; i++)
+            {
+                Dictionary<string, object> values = frames[i] as Dictionary<string, object>;
+                if (values == null)
+                {
+                    System.Collections.Hashtable table = frames[i] as System.Collections.Hashtable;
+                    if (table != null)
+                    {
+                        values = new Dictionary<string, object>();
+                        foreach (System.Collections.DictionaryEntry entry in table)
+                        {
+                            values[Convert.ToString(entry.Key)] = entry.Value;
+                        }
+                    }
+                }
+
+                if (values == null || !values.ContainsKey("src"))
+                {
+                    continue;
+                }
+
+                string src = Convert.ToString(values["src"]);
+                if (IsStreamPlayerUrl(src))
+                {
+                    return src.Trim();
+                }
+            }
+
+            return string.Empty;
+        }
+
+        private static bool IsStreamPlayerUrl(string url)
+        {
+            if (string.IsNullOrWhiteSpace(url))
+            {
+                return false;
+            }
+
+            string lower = url.Trim().ToLowerInvariant();
+            return lower.IndexOf("player.kick.com/") >= 0 ||
+                lower.IndexOf("player.twitch.tv/") >= 0 ||
+                lower.IndexOf("youtube.com/embed/") >= 0 ||
+                lower.IndexOf("youtube-nocookie.com/embed/") >= 0;
         }
 
         private void OnBigscreenChipMouseEnter(object sender, EventArgs e)
@@ -5143,8 +10141,146 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 return;
             }
 
-            NavigateToUrl(url);
+            if (IsChatPage())
+            {
+                SelectStreamChatEmbedFromTopBar(url, string.Empty, string.Empty);
+                return;
+            }
+
+            string targetUrl = ResolveBigscreenSelectionUrl(url, null, null);
+            if (string.IsNullOrWhiteSpace(targetUrl))
+            {
+                targetUrl = BigscreenBarUrl;
+            }
+
+            NavigateToUrl(targetUrl);
             SetStatus("Opened bigscreen selection. Click Chat to return to chat-only view.");
+        }
+
+        private string ResolveBigscreenSelectionUrl(string url, string platformHint, string mediaIdHint)
+        {
+            if (string.IsNullOrWhiteSpace(url))
+            {
+                return null;
+            }
+
+            string hintedRoute = BuildBigscreenRouteFromPlatformMedia(platformHint, mediaIdHint);
+            if (!string.IsNullOrWhiteSpace(hintedRoute))
+            {
+                return hintedRoute;
+            }
+
+            BigscreenEmbedState parsed;
+            if (TryCreateEmbedStateFromBigscreenUrl(url, out parsed))
+            {
+                return url;
+            }
+
+            BigscreenEmbedState matched = null;
+            if (_latestBigscreenEmbeds != null)
+            {
+                foreach (BigscreenEmbedState embed in _latestBigscreenEmbeds)
+                {
+                    if (embed == null || string.IsNullOrWhiteSpace(embed.Url))
+                    {
+                        continue;
+                    }
+
+                    if (string.Equals(embed.Url, url, StringComparison.OrdinalIgnoreCase))
+                    {
+                        matched = embed;
+                        break;
+                    }
+                }
+            }
+
+            BigscreenEmbedState normalized = NormalizeBigscreenEmbedState(matched ?? new BigscreenEmbedState
+            {
+                Url = url
+            });
+            if (normalized == null || string.IsNullOrWhiteSpace(normalized.Platform) || string.IsNullOrWhiteSpace(normalized.MediaId))
+            {
+                Uri externalUri;
+                if (Uri.TryCreate(url, UriKind.Absolute, out externalUri))
+                {
+                    string host = externalUri.Host ?? string.Empty;
+                    string[] segments = externalUri.AbsolutePath.Trim('/').Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (host.IndexOf("kick.com", StringComparison.OrdinalIgnoreCase) >= 0 && segments.Length > 0)
+                    {
+                        return BuildBigscreenRouteFromPlatformMedia("kick", segments[0]);
+                    }
+                    if ((host.IndexOf("youtube.com", StringComparison.OrdinalIgnoreCase) >= 0 || host.IndexOf("youtu.be", StringComparison.OrdinalIgnoreCase) >= 0))
+                    {
+                        string videoId = string.Empty;
+                        if (host.IndexOf("youtu.be", StringComparison.OrdinalIgnoreCase) >= 0 && segments.Length > 0)
+                        {
+                            videoId = segments[0];
+                        }
+                        else
+                        {
+                            videoId = GetQueryParameter(externalUri.Query, "v");
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(videoId))
+                        {
+                            return BuildBigscreenRouteFromPlatformMedia("youtube", videoId);
+                        }
+                    }
+                }
+                return null;
+            }
+
+            string platform = normalized.Platform.Trim().Trim('/').ToLowerInvariant();
+            string mediaId = normalized.MediaId.Trim().Trim('/');
+            if (string.IsNullOrWhiteSpace(platform) || string.IsNullOrWhiteSpace(mediaId))
+            {
+                return null;
+            }
+
+            return BuildBigscreenRouteFromPlatformMedia(platform, mediaId);
+        }
+
+        private static string BuildBigscreenRouteFromPlatformMedia(string platform, string mediaId)
+        {
+            if (string.IsNullOrWhiteSpace(platform) || string.IsNullOrWhiteSpace(mediaId))
+            {
+                return null;
+            }
+
+            string normalizedPlatform = platform.Trim().Trim('/').ToLowerInvariant();
+            string normalizedMediaId = mediaId.Trim().Trim('/');
+            if (string.IsNullOrWhiteSpace(normalizedPlatform) || string.IsNullOrWhiteSpace(normalizedMediaId))
+            {
+                return null;
+            }
+
+            return BigscreenBarUrl + "#" + normalizedPlatform + "/" + normalizedMediaId;
+        }
+
+        private static string GetQueryParameter(string query, string key)
+        {
+            if (string.IsNullOrWhiteSpace(query) || string.IsNullOrWhiteSpace(key))
+            {
+                return string.Empty;
+            }
+
+            string trimmed = query.TrimStart('?');
+            string[] parts = trimmed.Split(new[] { '&' }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (string part in parts)
+            {
+                string[] kv = part.Split(new[] { '=' }, 2);
+                if (kv.Length < 2)
+                {
+                    continue;
+                }
+
+                if (string.Equals(Uri.UnescapeDataString(kv[0]), key, StringComparison.OrdinalIgnoreCase))
+                {
+                    return Uri.UnescapeDataString(kv[1]);
+                }
+            }
+
+            return string.Empty;
         }
 
         private void UpdateNavigationButtons()
@@ -5269,7 +10405,38 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
         private void OnBigscreenClicked(object sender, EventArgs e)
         {
-            NavigateToUrl(BigscreenBarUrl);
+            string targetUrl = null;
+            if (!string.IsNullOrWhiteSpace(_preferredChatEmbedUrl))
+            {
+                string platformHint = null;
+                string mediaIdHint = null;
+                if (_latestBigscreenEmbeds != null)
+                {
+                    foreach (BigscreenEmbedState embed in _latestBigscreenEmbeds)
+                    {
+                        if (embed == null || string.IsNullOrWhiteSpace(embed.Url))
+                        {
+                            continue;
+                        }
+
+                        if (string.Equals(embed.Url.Trim(), _preferredChatEmbedUrl, StringComparison.OrdinalIgnoreCase))
+                        {
+                            platformHint = embed.Platform;
+                            mediaIdHint = embed.MediaId;
+                            break;
+                        }
+                    }
+                }
+
+                targetUrl = ResolveBigscreenSelectionUrl(_preferredChatEmbedUrl, platformHint, mediaIdHint);
+            }
+
+            if (string.IsNullOrWhiteSpace(targetUrl))
+            {
+                targetUrl = BigscreenBarUrl;
+            }
+
+            NavigateToUrl(targetUrl);
         }
 
         private void OnReloadClicked(object sender, EventArgs e)
@@ -5458,8 +10625,62 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             SetStatus("Returned the popped out media to the main window.");
         }
 
+        private BigscreenEmbedState GetStreamChatEmbed()
+        {
+            if (!string.IsNullOrWhiteSpace(_preferredChatEmbedUrl) && _latestBigscreenEmbeds != null)
+            {
+                foreach (BigscreenEmbedState embed in _latestBigscreenEmbeds)
+                {
+                    if (embed == null || string.IsNullOrWhiteSpace(embed.Url))
+                    {
+                        continue;
+                    }
+
+                    if (string.Equals(embed.Url.Trim(), _preferredChatEmbedUrl, StringComparison.OrdinalIgnoreCase))
+                    {
+                        BigscreenEmbedState normalizedPreferred = NormalizeBigscreenEmbedState(embed);
+                        if (normalizedPreferred != null &&
+                            !string.IsNullOrWhiteSpace(BuildStreamChatUrl(normalizedPreferred, false)))
+                        {
+                            return normalizedPreferred;
+                        }
+                    }
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(_activeStreamPlayerUrl))
+            {
+                string trimmed = _activeStreamPlayerUrl.Trim();
+                BigscreenEmbedState fromPlayer;
+                if (TryCreateEmbedStateFromExternalStreamUrl(trimmed, out fromPlayer) ||
+                    TryCreateEmbedStateFromBigscreenUrl(trimmed, out fromPlayer))
+                {
+                    fromPlayer = NormalizeBigscreenEmbedState(fromPlayer);
+                    if (fromPlayer != null && !string.IsNullOrWhiteSpace(fromPlayer.Url))
+                    {
+                        if (!string.IsNullOrWhiteSpace(BuildStreamChatUrl(fromPlayer, false)))
+                        {
+                            return fromPlayer;
+                        }
+                    }
+                }
+            }
+
+            return GetSelectedBigscreenEmbed();
+        }
+
         private BigscreenEmbedState GetSelectedBigscreenEmbed()
         {
+            Uri currentSource = _webView != null ? _webView.Source : null;
+            if (currentSource != null && currentSource.AbsolutePath.StartsWith("/bigscreen", StringComparison.OrdinalIgnoreCase))
+            {
+                BigscreenEmbedState sourceEmbed;
+                if (TryCreateEmbedStateFromBigscreenUrl(currentSource.AbsoluteUri, out sourceEmbed))
+                {
+                    return sourceEmbed;
+                }
+            }
+
             if (_latestBigscreenEmbeds == null || _latestBigscreenEmbeds.Count == 0)
             {
                 return null;
@@ -5587,6 +10808,18 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         mediaId = parsedEmbed.MediaId;
                     }
                 }
+                else if (TryCreateEmbedStateFromExternalStreamUrl(embed.Url, out parsedEmbed))
+                {
+                    if (string.IsNullOrWhiteSpace(platform))
+                    {
+                        platform = parsedEmbed.Platform;
+                    }
+
+                    if (string.IsNullOrWhiteSpace(mediaId))
+                    {
+                        mediaId = parsedEmbed.MediaId;
+                    }
+                }
             }
 
             return new BigscreenEmbedState
@@ -5647,6 +10880,221 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             return true;
         }
 
+        private static bool TryCreateEmbedStateFromExternalStreamUrl(string url, out BigscreenEmbedState embed)
+        {
+            embed = null;
+
+            if (string.IsNullOrWhiteSpace(url))
+            {
+                return false;
+            }
+
+            Uri uri;
+            if (!Uri.TryCreate(url, UriKind.Absolute, out uri))
+            {
+                return false;
+            }
+
+            string host = (uri.Host ?? string.Empty).ToLowerInvariant();
+            if (host.EndsWith("destiny.gg", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            string[] reservedKickSlugs =
+            {
+                "video", "categories", "search", "login", "signup", "settings", "download", "dashboard",
+                "browse", "community-guidelines", "terms-of-service", "privacy-policy", "mobile", "api"
+            };
+
+            if (host.IndexOf("kick.com", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                if (host.StartsWith("player.", StringComparison.OrdinalIgnoreCase))
+                {
+                    string[] playerSegments = uri.AbsolutePath.Trim('/').Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (playerSegments.Length >= 1)
+                    {
+                        string playerSlug = playerSegments[0];
+                        for (int i = 0; i < reservedKickSlugs.Length; i++)
+                        {
+                            if (playerSlug.Equals(reservedKickSlugs[i], StringComparison.OrdinalIgnoreCase))
+                            {
+                                return false;
+                            }
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(playerSlug))
+                        {
+                            embed = new BigscreenEmbedState
+                            {
+                                Url = uri.AbsoluteUri,
+                                Platform = "kick",
+                                MediaId = playerSlug,
+                                DisplayText = string.Empty,
+                                TooltipText = string.Empty,
+                                IsSelected = true
+                            };
+                            return true;
+                        }
+                    }
+
+                    return false;
+                }
+
+                string[] segments = uri.AbsolutePath.Trim('/').Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+                if (segments.Length >= 3 &&
+                    segments[0].Equals("popout", StringComparison.OrdinalIgnoreCase) &&
+                    segments[2].Equals("chat", StringComparison.OrdinalIgnoreCase))
+                {
+                    embed = new BigscreenEmbedState
+                    {
+                        Url = uri.AbsoluteUri,
+                        Platform = "kick",
+                        MediaId = segments[1],
+                        DisplayText = string.Empty,
+                        TooltipText = string.Empty,
+                        IsSelected = true
+                    };
+                    return true;
+                }
+
+                if (segments.Length >= 1)
+                {
+                    string slug = segments[0];
+                    for (int i = 0; i < reservedKickSlugs.Length; i++)
+                    {
+                        if (slug.Equals(reservedKickSlugs[i], StringComparison.OrdinalIgnoreCase))
+                        {
+                            return false;
+                        }
+                    }
+
+                    embed = new BigscreenEmbedState
+                    {
+                        Url = uri.AbsoluteUri,
+                        Platform = "kick",
+                        MediaId = slug,
+                        DisplayText = string.Empty,
+                        TooltipText = string.Empty,
+                        IsSelected = true
+                    };
+                    return true;
+                }
+            }
+
+            if (host.IndexOf("youtu.be", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                string[] segments = uri.AbsolutePath.Trim('/').Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+                if (segments.Length >= 1 && !string.IsNullOrWhiteSpace(segments[0]))
+                {
+                    embed = new BigscreenEmbedState
+                    {
+                        Url = uri.AbsoluteUri,
+                        Platform = "youtube",
+                        MediaId = segments[0],
+                        DisplayText = string.Empty,
+                        TooltipText = string.Empty,
+                        IsSelected = true
+                    };
+                    return true;
+                }
+            }
+
+            if (host.IndexOf("youtube.com", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                host.IndexOf("youtube-nocookie.com", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                string videoId = GetQueryParameter(uri.Query, "v");
+                if (!string.IsNullOrWhiteSpace(videoId))
+                {
+                    embed = new BigscreenEmbedState
+                    {
+                        Url = uri.AbsoluteUri,
+                        Platform = "youtube",
+                        MediaId = videoId,
+                        DisplayText = string.Empty,
+                        TooltipText = string.Empty,
+                        IsSelected = true
+                    };
+                    return true;
+                }
+
+                string[] segments = uri.AbsolutePath.Trim('/').Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+                if (segments.Length >= 2 && segments[0].Equals("live", StringComparison.OrdinalIgnoreCase) &&
+                    !string.IsNullOrWhiteSpace(segments[1]))
+                {
+                    embed = new BigscreenEmbedState
+                    {
+                        Url = uri.AbsoluteUri,
+                        Platform = "youtube",
+                        MediaId = segments[1],
+                        DisplayText = string.Empty,
+                        TooltipText = string.Empty,
+                        IsSelected = true
+                    };
+                    return true;
+                }
+
+                if (segments.Length >= 2 && segments[0].Equals("embed", StringComparison.OrdinalIgnoreCase) &&
+                    !string.IsNullOrWhiteSpace(segments[1]))
+                {
+                    embed = new BigscreenEmbedState
+                    {
+                        Url = uri.AbsoluteUri,
+                        Platform = "youtube",
+                        MediaId = segments[1],
+                        DisplayText = string.Empty,
+                        TooltipText = string.Empty,
+                        IsSelected = true
+                    };
+                    return true;
+                }
+            }
+
+            if (host.IndexOf("twitch.tv", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                if (host.IndexOf("player.", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    string channel = GetQueryParameter(uri.Query, "channel");
+                    if (string.IsNullOrWhiteSpace(channel))
+                    {
+                        channel = GetQueryParameter(uri.Query, "stream");
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(channel))
+                    {
+                        embed = new BigscreenEmbedState
+                        {
+                            Url = uri.AbsoluteUri,
+                            Platform = "twitch",
+                            MediaId = channel,
+                            DisplayText = string.Empty,
+                            TooltipText = string.Empty,
+                            IsSelected = true
+                        };
+                        return true;
+                    }
+                }
+
+                string[] segments = uri.AbsolutePath.Trim('/').Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+                if (segments.Length >= 1 && !segments[0].Equals("videos", StringComparison.OrdinalIgnoreCase) &&
+                    !segments[0].Equals("directory", StringComparison.OrdinalIgnoreCase))
+                {
+                    embed = new BigscreenEmbedState
+                    {
+                        Url = uri.AbsoluteUri,
+                        Platform = "twitch",
+                        MediaId = segments[0],
+                        DisplayText = string.Empty,
+                        TooltipText = string.Empty,
+                        IsSelected = true
+                    };
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         private static string GetDirectExternalUrl(string url)
         {
             Uri uri;
@@ -5663,7 +11111,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             return uri.AbsoluteUri;
         }
 
-        private static string BuildStreamChatUrl(BigscreenEmbedState embed)
+        private static string BuildStreamChatUrl(BigscreenEmbedState embed, bool useEmbeddedHost)
         {
             BigscreenEmbedState normalizedEmbed = NormalizeBigscreenEmbedState(embed);
             if (normalizedEmbed == null)
@@ -5680,8 +11128,19 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 case "twitch":
                     return BuildTwitchChatUrl(normalizedEmbed.MediaId);
                 case "youtube":
-                    return BuildYouTubeChatUrl(normalizedEmbed.MediaId);
+                    return BuildYouTubeChatUrl(normalizedEmbed.MediaId, useEmbeddedHost);
                 case "kick":
+                    if (!string.IsNullOrWhiteSpace(normalizedEmbed.Url))
+                    {
+                        string lowerUrl = normalizedEmbed.Url.ToLowerInvariant();
+                        if (lowerUrl.IndexOf("kick.com", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                            lowerUrl.IndexOf("/popout/", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                            lowerUrl.IndexOf("/chat", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            return NormalizeKickStreamChatNavigationUrl(normalizedEmbed.Url);
+                        }
+                    }
+
                     return BuildKickChatUrl(normalizedEmbed.MediaId);
                 default:
                     return null;
@@ -5703,7 +11162,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 + "&darkpopout=1";
         }
 
-        private static string BuildYouTubeChatUrl(string mediaId)
+        private static string BuildYouTubeChatUrl(string mediaId, bool useEmbeddedHost)
         {
             string videoId = GetPrimaryMediaPathSegment(mediaId);
             if (string.IsNullOrWhiteSpace(videoId))
@@ -5711,9 +11170,19 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 return null;
             }
 
+            if (useEmbeddedHost)
+            {
+                return "https://www.youtube.com/live_chat?v="
+                    + Uri.EscapeDataString(videoId)
+                    + "&embed_domain="
+                    + Uri.EscapeDataString(DefaultTwitchParent);
+            }
+
             return "https://www.youtube.com/live_chat?v="
                 + Uri.EscapeDataString(videoId)
-                + "&is_popout=1";
+                + "&embed_domain="
+                + Uri.EscapeDataString(DefaultTwitchParent)
+                + "&dark_theme=1&is_popout=1";
         }
 
         private static string BuildKickChatUrl(string mediaId)
@@ -5725,6 +11194,44 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             }
 
             return "https://kick.com/popout/" + Uri.EscapeDataString(channel) + "/chat";
+        }
+
+        /// <summary>
+        /// Kick serves popout chat reliably on apex kick.com; normalize www / redirects for WebView2 navigation.
+        /// </summary>
+        private static string NormalizeKickStreamChatNavigationUrl(string url)
+        {
+            if (string.IsNullOrWhiteSpace(url))
+            {
+                return url;
+            }
+
+            string trimmed = url.Trim();
+            if (trimmed.IndexOf("kick.com", StringComparison.OrdinalIgnoreCase) < 0)
+            {
+                return trimmed;
+            }
+
+            if (trimmed.IndexOf("/popout/", StringComparison.OrdinalIgnoreCase) < 0 ||
+                trimmed.IndexOf("/chat", StringComparison.OrdinalIgnoreCase) < 0)
+            {
+                return trimmed;
+            }
+
+            try
+            {
+                Uri uri = new Uri(trimmed);
+                UriBuilder builder = new UriBuilder(uri)
+                {
+                    Scheme = Uri.UriSchemeHttps,
+                    Host = "kick.com"
+                };
+                return builder.Uri.AbsoluteUri;
+            }
+            catch
+            {
+                return trimmed;
+            }
         }
 
         private static string BuildTwitchPlayerUrl(string parameterName, string mediaId)
@@ -5994,6 +11501,11 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 return;
             }
 
+            if (ShouldResetChatLayoutForNavigation(uri))
+            {
+                ResetChatLayoutForModeSwitch();
+            }
+
             _pendingNavigation = uri.AbsoluteUri;
             UpdateAddressBox(_pendingNavigation);
             UpdateBigscreenBarVisibility();
@@ -6002,6 +11514,22 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             {
                 _webView.CoreWebView2.Navigate(_pendingNavigation);
             }
+        }
+
+        private bool ShouldResetChatLayoutForNavigation(Uri targetUri)
+        {
+            if (targetUri == null || _webView == null || _webView.Source == null)
+            {
+                return false;
+            }
+
+            Uri currentUri = _webView.Source;
+            bool currentChat = IsChatUri(currentUri);
+            bool currentBigscreen = IsBigscreenUri(currentUri);
+            bool targetChat = IsChatUri(targetUri);
+            bool targetBigscreen = IsBigscreenUri(targetUri);
+
+            return (currentChat && targetBigscreen) || (currentBigscreen && targetChat);
         }
 
         private bool TryBuildUri(string input, out Uri uri)
@@ -6081,6 +11609,18 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             }
             catch (Exception ex)
             {
+                // #region agent log
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "N3",
+                    "DestinyChatDesktop.cs:6366",
+                    "Open in browser failed",
+                    new Dictionary<string, object>
+                    {
+                        { "url", url ?? string.Empty },
+                        { "error", ex.Message }
+                    });
+                // #endregion
                 SetStatus("Could not open the browser: " + ex.Message);
             }
         }
@@ -6212,6 +11752,10 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     html.Append(selectedClass);
                     html.Append("\" href=\"#\" data-url=\"");
                     html.Append(url);
+                    html.Append("\" data-platform=\"");
+                    html.Append(WebUtility.HtmlEncode(embed.Platform ?? string.Empty));
+                    html.Append("\" data-mediaid=\"");
+                    html.Append(WebUtility.HtmlEncode(embed.MediaId ?? string.Empty));
                     html.Append("\" title=\"");
                     html.Append(title);
                     html.Append("\">");
@@ -6231,7 +11775,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             html.Append("const host=window.chrome&&window.chrome.webview;");
             html.Append("const list=document.getElementById('list');");
             html.Append("if(list){list.addEventListener('wheel',function(e){if(e.deltaX===0){e.preventDefault();list.scrollBy({left:e.deltaY>0?40:-40,behavior:'auto'});}}, {passive:false});}");
-            html.Append("document.addEventListener('click',function(e){const link=e.target.closest('a.embed-link');if(!link){return;}e.preventDefault();if(host){host.postMessage({type:'openEmbed',url:link.dataset.url||''});}});");
+            html.Append("document.addEventListener('click',function(e){const link=e.target.closest('a.embed-link');if(!link){return;}e.preventDefault();if(host){host.postMessage({type:'openEmbed',url:link.dataset.url||'',platform:link.dataset.platform||'',mediaId:link.dataset.mediaid||''});}});");
             html.Append("</script></body></html>");
             return html.ToString();
         }
@@ -6352,8 +11896,20 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     _webView.CoreWebView2.CookieManager.AddOrUpdateCookie(cookie);
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                // #region agent log
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "N3",
+                    "DestinyChatDesktop.cs:6639",
+                    "Restore cookies failed",
+                    new Dictionary<string, object>
+                    {
+                        { "cookiePath", _cookiePath ?? string.Empty },
+                        { "error", ex.Message }
+                    });
+                // #endregion
                 // Ignore bad persisted cookie data and continue with a clean browser session.
             }
         }
@@ -6395,8 +11951,20 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 JavaScriptSerializer serializer = new JavaScriptSerializer();
                 File.WriteAllText(_cookiePath, serializer.Serialize(cookieStates));
             }
-            catch
+            catch (Exception ex)
             {
+                // #region agent log
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "N3",
+                    "DestinyChatDesktop.cs:6682",
+                    "Save cookies failed",
+                    new Dictionary<string, object>
+                    {
+                        { "cookiePath", _cookiePath ?? string.Empty },
+                        { "error", ex.Message }
+                    });
+                // #endregion
                 // Cookie persistence is best-effort; failure should not block app shutdown.
             }
             finally
@@ -6472,6 +12040,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             try
             {
                 _sessionPersistTimer.Stop();
+                _sessionPersistTimer.Dispose();
 
                 Rectangle bounds = WindowState == FormWindowState.Normal ? DesktopBounds : RestoreBounds;
                 _state.X = bounds.X;
@@ -6526,10 +12095,10 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
                     const host = window.chrome && window.chrome.webview;
                     if (!host || typeof host.postMessage !== 'function') return;
+                    let lastEmbeddedStreamChatEnabled = null;
 
-                    // Selectors for the right-side chat container on destiny.gg bigscreen.
-                    // We want the first element that represents where the chat region starts.
-                    const CHAT_SELECTORS = [
+                    const CHAT_TOP_SELECTORS = [
+                        '#chat-output-frame',
                         '#chat-wrap',
                         '#chat',
                         '.chat-wrap',
@@ -6538,63 +12107,530 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         '.sidebar'
                     ];
 
-                    let reported = false;
+                    const INPUT_SELECTORS = [
+                        '#chat-input-control',
+                        '#chat-input-wrap',
+                        '#chat-input-frame',
+                        '#chat-tools-wrap',
+                        '.chat-tools-group'
+                    ];
 
-                    function reportChatTop() {
-                        let chatTop = 0;
-                        for (let i = 0; i < CHAT_SELECTORS.length; i++) {
-                            const el = document.querySelector(CHAT_SELECTORS[i]);
-                            if (el) {
+                    function getTopFromDocument(doc, selectors, topPadding) {
+                        if (!doc) {
+                            return 0;
+                        }
+
+                        let top = 0;
+                        for (let i = 0; i < selectors.length; i++) {
+                            const matches = Array.from(doc.querySelectorAll(selectors[i]));
+                            for (let j = 0; j < matches.length; j++) {
+                                const el = matches[j];
+                                if (!el || typeof el.getBoundingClientRect !== 'function') {
+                                    continue;
+                                }
+
                                 const rect = el.getBoundingClientRect();
-                                if (rect.height > 10) {
-                                    chatTop = Math.max(0, Math.round(rect.top));
-                                    break;
+                                if (rect.height > 2 && rect.width > 2) {
+                                    if (top <= 0 || rect.top < top) {
+                                        top = rect.top;
+                                    }
                                 }
                             }
                         }
 
-                        host.postMessage({ type: 'codex-bigscreen-layout', chatTop: chatTop });
+                        return top > 0 ? Math.max(0, Math.round(top - (topPadding || 0))) : 0;
                     }
 
-                    function tryReport() {
-                        for (let i = 0; i < CHAT_SELECTORS.length; i++) {
-                            const el = document.querySelector(CHAT_SELECTORS[i]);
-                            if (el && el.getBoundingClientRect().height > 10) {
-                                reportChatTop();
-                                reported = true;
-                                return true;
+                    function getTopFromSelectors(selectors, topPadding) {
+                        return getTopFromDocument(document, selectors, topPadding);
+                    }
+
+                    function getEmbeddedChatInputTop() {
+                        const frames = Array.from(document.querySelectorAll('iframe'));
+                        for (let i = 0; i < frames.length; i++) {
+                            const frame = frames[i];
+                            const src = String(frame && (frame.getAttribute('src') || frame.src || '')).toLowerCase();
+                            if (src.indexOf('/embed/chat') < 0) {
+                                continue;
+                            }
+
+                            let doc = null;
+                            try {
+                                doc = frame.contentDocument;
+                            } catch (error) {
+                                doc = null;
+                            }
+
+                            if (!doc) {
+                                continue;
+                            }
+
+                            const innerTop = getTopFromDocument(doc, INPUT_SELECTORS, 10);
+                            if (innerTop <= 0) {
+                                continue;
+                            }
+
+                            const frameRect = frame.getBoundingClientRect();
+                            return Math.max(0, Math.round(frameRect.top + innerTop));
+                        }
+
+                        return 0;
+                    }
+
+                    function getEmbeddedChatFrameTop() {
+                        const frames = Array.from(document.querySelectorAll('iframe'));
+                        for (let i = 0; i < frames.length; i++) {
+                            const frame = frames[i];
+                            const src = String(frame && (frame.getAttribute('src') || frame.src || '')).toLowerCase();
+                            if (src.indexOf('/embed/chat') < 0) {
+                                continue;
+                            }
+
+                            const rect = frame.getBoundingClientRect();
+                            if (rect.height > 20 && rect.width > 20) {
+                                return Math.max(0, Math.round(rect.top));
                             }
                         }
-                        return false;
+
+                        return 0;
                     }
 
-                    // Report on resize too (window resize changes layout).
-                    window.addEventListener('resize', reportChatTop);
+                    function getChatInputTop() {
+                        const directTop = getTopFromSelectors(INPUT_SELECTORS, 10);
+                        const embeddedTop = getEmbeddedChatInputTop();
+                        if (directTop > 0 && embeddedTop > 0) {
+                            return Math.min(directTop, embeddedTop);
+                        }
 
-                    if (document.readyState === 'loading') {
-                        document.addEventListener('DOMContentLoaded', () => {
-                            if (!tryReport()) {
-                                // Wait for the layout to settle after initial render.
-                                window.requestAnimationFrame(() => {
-                                    window.requestAnimationFrame(tryReport);
-                                });
+                        return Math.max(directTop, embeddedTop);
+                    }
+
+                    function getMediaBottom() {
+                        const candidates = [];
+                        const iframeCandidates = Array.from(document.querySelectorAll('iframe'));
+                        for (let i = 0; i < iframeCandidates.length; i++) {
+                            const frame = iframeCandidates[i];
+                            const src = String(frame && (frame.getAttribute('src') || frame.src || '')).toLowerCase();
+                            if (!src) {
+                                continue;
                             }
-                        }, { once: true });
-                    } else {
-                        if (!tryReport()) {
-                            window.requestAnimationFrame(() => {
-                                window.requestAnimationFrame(tryReport);
+                            if (src.indexOf('player.kick.com') >= 0 ||
+                                src.indexOf('kick.com/embed') >= 0 ||
+                                src.indexOf('youtube.com/embed') >= 0 ||
+                                src.indexOf('twitch.tv') >= 0) {
+                                candidates.push(frame);
+                            }
+                        }
+
+                        const video = document.querySelector('video') || document.querySelector('.video-js video');
+                        if (video) {
+                            candidates.push(video);
+                        }
+
+                        let bottom = 0;
+                        for (let i = 0; i < candidates.length; i++) {
+                            const el = candidates[i];
+                            if (!el || typeof el.getBoundingClientRect !== 'function') {
+                                continue;
+                            }
+                            const rect = el.getBoundingClientRect();
+                            if (rect.width < 40 || rect.height < 40) {
+                                continue;
+                            }
+                            bottom = Math.max(bottom, Math.round(rect.bottom));
+                        }
+
+                        return Math.max(0, bottom);
+                    }
+
+                    function reportLayout() {
+                        const selectorTop = getTopFromSelectors(CHAT_TOP_SELECTORS);
+                        const embeddedChatTop = getEmbeddedChatFrameTop();
+                        const mediaBottom = getMediaBottom();
+                        const chatTop = embeddedChatTop > 0
+                            ? embeddedChatTop
+                            : (selectorTop > 0 ? selectorTop : mediaBottom);
+                        const inputTop = getChatInputTop();
+                        host.postMessage({
+                            type: 'codex-bigscreen-layout',
+                            chatTop: chatTop,
+                            inputTop: inputTop,
+                            windowWidth: Math.round(window.innerWidth || 0),
+                            windowHeight: Math.round(window.innerHeight || 0)
+                        });
+                    }
+
+                    function reportDebugLayout() {
+                        const selectors = [
+                            '#chat-output-frame',
+                            '#chat-wrap',
+                            '#chat',
+                            '.chat-wrap',
+                            '.chat',
+                            '#sidebar',
+                            '.sidebar',
+                            '#movie-content',
+                            '.movie-content',
+                            '#bigscreen-content',
+                            '.bigscreen-content',
+                            '#stream-info',
+                            '.stream-info',
+                            '.movierooms',
+                            '.movierooms-panel',
+                            '.movierooms-body',
+                            '.movierooms-content',
+                            '.video-js',
+                            'video'
+                        ];
+                        const candidates = [];
+                        for (let i = 0; i < selectors.length; i++) {
+                            const selector = selectors[i];
+                            const el = document.querySelector(selector);
+                            if (!el) {
+                                continue;
+                            }
+
+                            const rect = el.getBoundingClientRect();
+                            candidates.push({
+                                selector: selector,
+                                top: Math.round(rect.top || 0),
+                                left: Math.round(rect.left || 0),
+                                width: Math.round(rect.width || 0),
+                                height: Math.round(rect.height || 0)
                             });
                         }
+
+                        host.postMessage({
+                            type: 'codex-bigscreen-layout-debug',
+                            bodyDualChatEnabled: !!document.body?.classList?.contains('codex-dual-chat-enabled'),
+                            bodySplitChatEnabled: !!document.body?.classList?.contains('codex-split-chat-enabled'),
+                            windowWidth: Math.round(window.innerWidth || 0),
+                            windowHeight: Math.round(window.innerHeight || 0),
+                            candidates: candidates
+                        });
                     }
 
-                    window.addEventListener('load', () => {
-                        if (!reported) {
-                            tryReport();
+                    function reportMediaState() {
+                        const video = document.querySelector('video') || document.querySelector('.video-js video');
+                        const iframes = Array.from(document.querySelectorAll('iframe')).slice(0, 5).map(frame => ({
+                            src: frame && frame.src ? frame.src : '',
+                            id: frame && frame.id ? frame.id : '',
+                            cls: frame && frame.className ? String(frame.className) : ''
+                        }));
+                        const payload = {
+                            type: 'codex-bigscreen-media-state',
+                            href: location.href || '',
+                            hasVideo: !!video,
+                            iframeCount: document.querySelectorAll('iframe').length,
+                            iframePreview: iframes,
+                            windowWidth: Math.round(window.innerWidth || 0),
+                            windowHeight: Math.round(window.innerHeight || 0)
+                        };
+
+                        if (video) {
+                            payload.paused = !!video.paused;
+                            payload.ended = !!video.ended;
+                            payload.muted = !!video.muted;
+                            payload.readyState = Number(video.readyState || 0);
+                            payload.networkState = Number(video.networkState || 0);
+                            payload.currentTime = Number(video.currentTime || 0);
+                            payload.errorCode = video.error && video.error.code ? Number(video.error.code) : 0;
                         }
-                        // Report again after load in case lazy-rendered elements shifted layout.
-                        setTimeout(reportChatTop, 500);
+
+                        host.postMessage(payload);
+                    }
+
+                    function hideBigscreenActionButtons() {
+                        const setStyle = (el, prop, value) => {
+                            if (el && el.style && el.style.getPropertyValue(prop) !== value) {
+                                el.style.setProperty(prop, value);
+                            }
+                        };
+                        const candidates = Array.from(document.querySelectorAll('button, a, [role=""button""]'));
+                        let refreshEl = null;
+                        let cinemaEl = null;
+                        for (let i = 0; i < candidates.length; i++) {
+                            const el = candidates[i];
+                            if (!el || !el.textContent) {
+                                continue;
+                            }
+                            const txt = String(el.textContent).trim().toLowerCase();
+                            if (txt === 'refresh' || txt === 'cinema mode') {
+                                setStyle(el, 'display', 'none');
+                                if (txt === 'refresh') {
+                                    refreshEl = el;
+                                }
+                                else if (txt === 'cinema mode') {
+                                    cinemaEl = el;
+                                }
+                            }
+                        }
+                        if (refreshEl && cinemaEl) {
+                            let parent = refreshEl.parentElement;
+                            let depth = 0;
+                            while (parent && depth < 6) {
+                                if (parent.contains(cinemaEl)) {
+                                    setStyle(parent, 'display', 'none');
+                                    setStyle(parent, 'max-height', '0px');
+                                    setStyle(parent, 'min-height', '0px');
+                                    setStyle(parent, 'height', '0px');
+                                    setStyle(parent, 'margin', '0');
+                                    setStyle(parent, 'padding', '0');
+                                    setStyle(parent, 'border', '0');
+                                    setStyle(parent, 'overflow', 'hidden');
+                                    break;
+                                }
+                                parent = parent.parentElement;
+                                depth += 1;
+                            }
+                        }
+                    }
+
+                    function syncBigscreenDualFromEmbeddedChat() {
+                        const allFrames = Array.from(document.querySelectorAll('iframe'));
+                        let chatFrame = null;
+                        let kickChatFrame = null;
+                        let kickPlayerFrame = null;
+                        for (let i = 0; i < allFrames.length; i++) {
+                            const frame = allFrames[i];
+                            const src = String(frame && (frame.getAttribute('src') || frame.src || '')).toLowerCase();
+                            if (!src) continue;
+                            if (!chatFrame && src.indexOf('/embed/chat') >= 0) {
+                                chatFrame = frame;
+                            }
+                            if (!kickPlayerFrame && src.indexOf('player.kick.com') >= 0) {
+                                kickPlayerFrame = frame;
+                            }
+                            if (!kickChatFrame && src.indexOf('kick.com') >= 0 && src.indexOf('player.kick.com') < 0) {
+                                if ((src.indexOf('/popout/') >= 0 && src.indexOf('/chat') >= 0) ||
+                                    src.indexOf('widgets.chat') >= 0 ||
+                                    src.indexOf('kick.com/chat') >= 0) {
+                                    kickChatFrame = frame;
+                                }
+                            }
+                        }
+
+                        let streamChatEnabled = false;
+                        let chatDoc = null;
+                        let streamButtonFound = false;
+                        if (chatFrame && chatFrame.contentDocument) {
+                            try {
+                                const doc = chatFrame.contentDocument;
+                                chatDoc = doc;
+                                const streamBtn = doc.getElementById('codex-stream-chat-btn') ||
+                                    doc.getElementById('codex-steam-chat-btn');
+                                streamButtonFound = !!streamBtn;
+                                streamChatEnabled = !!(streamBtn && streamBtn.classList && streamBtn.classList.contains('codex-split-chat-active'));
+                            } catch (error) {
+                                streamChatEnabled = false;
+                            }
+                        }
+
+                        if (streamButtonFound && lastEmbeddedStreamChatEnabled !== streamChatEnabled) {
+                            lastEmbeddedStreamChatEnabled = streamChatEnabled;
+                            try {
+                                host.postMessage({
+                                    type: 'codex-bigscreen-dual-toggle',
+                                    enabled: streamChatEnabled
+                                });
+                            } catch (error) {
+                            }
+                        }
+
+                        if (chatDoc && chatDoc.body) {
+                            try {
+                                const styleId = 'codex-desktop-external-chat-style';
+                                let style = chatDoc.getElementById(styleId);
+                                if (!style && chatDoc.head) {
+                                    style = chatDoc.createElement('style');
+                                    style.id = styleId;
+                                    style.textContent =
+                                        'body.codex-desktop-external-chat-active #chat-wrap,' +
+                                        'body.codex-desktop-external-chat-active .chat-wrap{' +
+                                        'width:calc((100% - 14px) / 2)!important;' +
+                                        'max-width:calc((100% - 14px) / 2)!important;' +
+                                        'box-sizing:border-box!important;' +
+                                        'overflow:hidden!important;' +
+                                        '}' +
+                                        'body.codex-desktop-external-chat-active #chat-output-frame,' +
+                                        'body.codex-desktop-external-chat-active .chat-output-frame{' +
+                                        'width:100%!important;' +
+                                        'max-width:100%!important;' +
+                                        'box-sizing:border-box!important;' +
+                                        '}' +
+                                        'body.codex-desktop-external-chat-active #chat-input-frame,' +
+                                        'body.codex-desktop-external-chat-active #chat-input-wrap,' +
+                                        'body.codex-desktop-external-chat-active #chat-input-control,' +
+                                        'body.codex-desktop-external-chat-active #chat-tools-wrap,' +
+                                        'body.codex-desktop-external-chat-active .chat-tools-group{' +
+                                        'width:calc((100% - 14px) / 2)!important;' +
+                                        'max-width:calc((100% - 14px) / 2)!important;' +
+                                        'box-sizing:border-box!important;' +
+                                        '}';
+                                    chatDoc.head.appendChild(style);
+                                }
+                                const rect = chatFrame.getBoundingClientRect();
+                                const topWidth = Math.round(window.innerWidth || document.documentElement.clientWidth || 0);
+                                const expectedHalf = topWidth > 0 ? Math.round((topWidth - 14) / 2) : 0;
+                                const tolerance = Math.max(24, Math.round(topWidth * 0.04));
+                                const needsInnerCollapse = streamChatEnabled &&
+                                    (!expectedHalf || Math.round(rect.width || 0) > expectedHalf + tolerance);
+                                chatDoc.body.classList.toggle('codex-desktop-external-chat-active', needsInnerCollapse);
+                            } catch (error) {
+                            }
+                        }
+
+                        document.body.classList.toggle('codex-bigscreen-dual-single-chat', !streamChatEnabled);
+
+                        const setImportantStyle = (el, prop, value) => {
+                            if (el.style.getPropertyValue(prop) !== value ||
+                                el.style.getPropertyPriority(prop) !== 'important') {
+                                el.style.setProperty(prop, value, 'important');
+                            }
+                        };
+
+                        const removeInlineStyle = (el, prop) => {
+                            if (el.style.getPropertyValue(prop)) {
+                                el.style.removeProperty(prop);
+                            }
+                        };
+
+                        const hideTarget = (el, hide) => {
+                            if (!el) return;
+                            if (hide) {
+                                setImportantStyle(el, 'display', 'none');
+                                setImportantStyle(el, 'width', '0');
+                                setImportantStyle(el, 'min-width', '0');
+                                setImportantStyle(el, 'max-width', '0');
+                                setImportantStyle(el, 'margin', '0');
+                                setImportantStyle(el, 'padding', '0');
+                                setImportantStyle(el, 'border', '0');
+                                setImportantStyle(el, 'overflow', 'hidden');
+                                setImportantStyle(el, 'flex', '0 0 0');
+                            } else {
+                                removeInlineStyle(el, 'display');
+                                removeInlineStyle(el, 'width');
+                                removeInlineStyle(el, 'min-width');
+                                removeInlineStyle(el, 'max-width');
+                                removeInlineStyle(el, 'margin');
+                                removeInlineStyle(el, 'padding');
+                                removeInlineStyle(el, 'border');
+                                removeInlineStyle(el, 'overflow');
+                                removeInlineStyle(el, 'flex');
+                            }
+                        };
+
+                        const fillTarget = (el, fill) => {
+                            if (!el) return;
+                            if (fill) {
+                                setImportantStyle(el, 'width', '100%');
+                                setImportantStyle(el, 'max-width', '100%');
+                                setImportantStyle(el, 'min-width', '0');
+                                setImportantStyle(el, 'flex', '1 1 auto');
+                            } else {
+                                removeInlineStyle(el, 'width');
+                                removeInlineStyle(el, 'max-width');
+                                removeInlineStyle(el, 'min-width');
+                                removeInlineStyle(el, 'flex');
+                            }
+                        };
+
+                        const kickChatTarget = kickChatFrame && kickChatFrame.parentElement ? kickChatFrame.parentElement : kickChatFrame;
+                        const chatTarget = chatFrame && chatFrame.parentElement ? chatFrame.parentElement : chatFrame;
+                        hideTarget(kickChatTarget, !streamChatEnabled);
+                        fillTarget(chatTarget, !streamChatEnabled);
+                    }
+
+                    function ensureBigscreenChatClampStyle() {
+                        if (document.getElementById('codex-bigscreen-chat-clamp-style') || !document.head) {
+                            return;
+                        }
+                        const st = document.createElement('style');
+                        st.id = 'codex-bigscreen-chat-clamp-style';
+                        st.textContent = 'body.codex-bigscreen-chat-below-media #chat-wrap,' +
+                            'body.codex-bigscreen-chat-below-media .chat-wrap{' +
+                            'margin-top:var(--codex-chat-below-media-push,0px)!important;' +
+                            'box-sizing:border-box!important;' +
+                            '}';
+                        document.head.appendChild(st);
+                    }
+
+                    function enforceBigscreenChatBelowMedia() {
+                        const mediaBottom = getMediaBottom();
+                        const root = document.documentElement;
+                        if (mediaBottom <= 48) {
+                            if (root.style.getPropertyValue('--codex-chat-below-media-push')) {
+                                root.style.removeProperty('--codex-chat-below-media-push');
+                            }
+                            return;
+                        }
+                        const wraps = [];
+                        const w1 = document.querySelector('#chat-wrap');
+                        const w2 = document.querySelector('.chat-wrap');
+                        if (w1) wraps.push(w1);
+                        if (w2 && w2 !== w1) wraps.push(w2);
+                        let maxPush = 0;
+                        for (let i = 0; i < wraps.length; i++) {
+                            const wrap = wraps[i];
+                            const rect = wrap.getBoundingClientRect();
+                            const push = Math.max(0, Math.round(mediaBottom - rect.top));
+                            maxPush = Math.max(maxPush, push);
+                        }
+                        const nextPush = maxPush + 'px';
+                        if (root.style.getPropertyValue('--codex-chat-below-media-push') !== nextPush) {
+                            root.style.setProperty('--codex-chat-below-media-push', nextPush);
+                        }
+                    }
+
+                    let scheduled = false;
+                    function scheduleReport() {
+                        if (scheduled) {
+                            return;
+                        }
+
+                        scheduled = true;
+                        window.requestAnimationFrame(() => {
+                            scheduled = false;
+                            hideBigscreenActionButtons();
+                            ensureBigscreenChatClampStyle();
+                            document.body.classList.add('codex-bigscreen-chat-below-media');
+                            enforceBigscreenChatBelowMedia();
+                            syncBigscreenDualFromEmbeddedChat();
+                            reportLayout();
+                            reportDebugLayout();
+                            reportMediaState();
+                        });
+                    }
+
+                    window.addEventListener('resize', scheduleReport);
+                    window.addEventListener('load', () => {
+                        scheduleReport();
+                        setTimeout(scheduleReport, 200);
+                        setTimeout(scheduleReport, 800);
                     });
+                    document.addEventListener('DOMContentLoaded', scheduleReport, { once: true });
+                    window.setInterval(reportMediaState, 2000);
+                    window.setInterval(hideBigscreenActionButtons, 1000);
+                    window.setInterval(syncBigscreenDualFromEmbeddedChat, 500);
+                    window.setInterval(() => {
+                        ensureBigscreenChatClampStyle();
+                        document.body.classList.add('codex-bigscreen-chat-below-media');
+                        enforceBigscreenChatBelowMedia();
+                    }, 400);
+
+                    if (typeof MutationObserver === 'function') {
+                        const observer = new MutationObserver(() => scheduleReport());
+                        const startObserver = () => {
+                            if (document.body) {
+                                observer.observe(document.body, { childList: true, subtree: true });
+                            }
+                        };
+
+                        startObserver();
+                        document.addEventListener('DOMContentLoaded', startObserver);
+                    }
+
+                    scheduleReport();
                 })();
             ");
         }
@@ -6630,6 +12666,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
         private readonly Timer _overlayTimer;
         private readonly double _aspectRatio;
         private bool _isPlaybackPaused;
+        private bool _pauseUsedMuteFallback;
         private bool _isClosing;
 
         [StructLayout(LayoutKind.Sequential)]
@@ -6723,6 +12760,19 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             }
             catch (Exception ex)
             {
+                // #region agent log
+                AgentDebugLog.Write(
+                    "pre-fix",
+                    "N4",
+                    "DestinyChatDesktop.cs:7017",
+                    "Media popout initialization failed",
+                    new Dictionary<string, object>
+                    {
+                        { "playerUrl", _target != null ? (_target.PlayerUrl ?? string.Empty) : string.Empty },
+                        { "useHostedVideoElement", _target != null && _target.UseHostedVideoElement },
+                        { "error", ex.Message }
+                    });
+                // #endregion
                 MessageBox.Show(
                     this,
                     "The media popout could not be opened.\r\n\r\n" + ex.Message,
@@ -7148,25 +13198,55 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
             try
             {
-                if (await TogglePlaybackWithScriptAsync())
+                bool targetPause = !_isPlaybackPaused;
+                // #region agent log
+                AgentDebugLog.Write(
+                    "post-fix",
+                    "P2",
+                    "DestinyChatDesktop.cs:7470",
+                    "Pause button target state",
+                    new Dictionary<string, object>
+                    {
+                        { "targetPause", targetPause },
+                        { "wasPaused", _isPlaybackPaused },
+                        { "usedMuteFallback", _pauseUsedMuteFallback }
+                    });
+                // #endregion
+
+                if (await SetPlaybackWithScriptAsync(targetPause))
                 {
                     return;
                 }
 
-                if (_isPlaybackPaused)
+                if (targetPause)
+                {
+                    if (await _webView.CoreWebView2.TrySuspendAsync())
+                    {
+                        _isPlaybackPaused = true;
+                        _pauseUsedMuteFallback = false;
+                        _pauseButton.Text = ">";
+                        return;
+                    }
+
+                    _webView.CoreWebView2.IsMuted = true;
+                    _isPlaybackPaused = true;
+                    _pauseUsedMuteFallback = true;
+                    _pauseButton.Text = ">";
+                    return;
+                }
+
+                if (_pauseUsedMuteFallback)
+                {
+                    _webView.CoreWebView2.IsMuted = false;
+                    _pauseUsedMuteFallback = false;
+                }
+                else
                 {
                     _webView.CoreWebView2.Resume();
-                    _isPlaybackPaused = false;
-                    _pauseButton.Text = "||";
-                    return;
                 }
 
-                bool suspended = await _webView.CoreWebView2.TrySuspendAsync();
-                if (suspended)
-                {
-                    _isPlaybackPaused = true;
-                    _pauseButton.Text = ">";
-                }
+                _isPlaybackPaused = false;
+                _pauseButton.Text = "||";
             }
             catch
             {
@@ -7174,29 +13254,94 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             }
         }
 
-        private async System.Threading.Tasks.Task<bool> TogglePlaybackWithScriptAsync()
+        public async System.Threading.Tasks.Task<Dictionary<string, object>> RunPauseResumeButtonSelfTestAsync()
+        {
+            Dictionary<string, object> result = new Dictionary<string, object>();
+            try
+            {
+                int attempts = 0;
+                while (_webView.CoreWebView2 == null && attempts < 60)
+                {
+                    attempts++;
+                    await System.Threading.Tasks.Task.Delay(100);
+                }
+
+                if (_webView.CoreWebView2 == null)
+                {
+                    result["ok"] = false;
+                    result["reason"] = "webview-not-ready";
+                    return result;
+                }
+
+                await System.Threading.Tasks.Task.Delay(300);
+                OnPauseButtonClicked(this, EventArgs.Empty);
+                await System.Threading.Tasks.Task.Delay(350);
+                bool pausedAfterFirstClick = _isPlaybackPaused;
+                OnPauseButtonClicked(this, EventArgs.Empty);
+                await System.Threading.Tasks.Task.Delay(350);
+                bool pausedAfterSecondClick = _isPlaybackPaused;
+
+                result["ok"] = pausedAfterFirstClick && !pausedAfterSecondClick;
+                result["pausedAfterFirstClick"] = pausedAfterFirstClick;
+                result["pausedAfterSecondClick"] = pausedAfterSecondClick;
+                result["pauseButtonText"] = _pauseButton.Text ?? string.Empty;
+                return result;
+            }
+            catch (Exception ex)
+            {
+                result["ok"] = false;
+                result["reason"] = "exception";
+                result["error"] = ex.Message;
+                return result;
+            }
+        }
+
+        private async System.Threading.Tasks.Task<bool> SetPlaybackWithScriptAsync(bool pause)
         {
             string resultJson = await _webView.CoreWebView2.ExecuteScriptAsync(@"
                 (() => {
-                    const videos = Array.from(document.querySelectorAll('video'));
-                    if (!videos.length) {
-                        return { handled: false, paused: false };
+                    function collectMedia() {
+                        const out = [];
+                        function walk(root) {
+                            try {
+                                for (const el of root.querySelectorAll('video, audio')) {
+                                    out.push(el);
+                                }
+                                for (const frame of root.querySelectorAll('iframe')) {
+                                    try {
+                                        const d = frame.contentDocument;
+                                        if (d) {
+                                            walk(d);
+                                        }
+                                    } catch (error) {
+                                    }
+                                }
+                            } catch (error) {
+                            }
+                        }
+                        walk(document);
+                        return out;
                     }
 
-                    const shouldPause = videos.some((video) => !video.paused);
+                    const media = collectMedia();
+                    if (!media.length) {
+                        return { handled: false, paused: false, mediaCount: 0 };
+                    }
+
+                    const shouldPause = " + (pause ? "true" : "false") + @";
                     if (shouldPause) {
-                        videos.forEach((video) => {
+                        media.forEach((el) => {
                             try {
-                                video.pause();
+                                el.pause();
                             } catch (error) {
                             }
                         });
-                        return { handled: true, paused: true };
+                        return { handled: true, paused: true, mediaCount: media.length };
                     }
 
-                    videos.forEach((video) => {
+                    media.forEach((el) => {
                         try {
-                            const playPromise = video.play();
+                            const playPromise = el.play();
                             if (playPromise && typeof playPromise.catch === 'function') {
                                 playPromise.catch(() => {});
                             }
@@ -7204,12 +13349,25 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         }
                     });
 
-                    return { handled: true, paused: false };
+                    return { handled: true, paused: false, mediaCount: media.length };
                 })();
             ");
 
             JavaScriptSerializer serializer = new JavaScriptSerializer();
             Dictionary<string, object> payload = serializer.Deserialize<Dictionary<string, object>>(resultJson);
+            // #region agent log
+            AgentDebugLog.Write(
+                "post-fix",
+                "P2",
+                "DestinyChatDesktop.cs:7578",
+                "Set playback script result",
+                new Dictionary<string, object>
+                {
+                    { "targetPause", pause },
+                    { "resultJson", resultJson ?? string.Empty },
+                    { "payloadParsed", payload != null }
+                });
+            // #endregion
             if (payload == null || !payload.ContainsKey("handled"))
             {
                 return false;
@@ -7240,6 +13398,14 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             html.Append(encodedUrl);
             html.Append("\"></video></body></html>");
             return html.ToString();
+        }
+    }
+
+    internal sealed class BorderlessToolStripRenderer : ToolStripProfessionalRenderer
+    {
+        protected override void OnRenderToolStripBorder(ToolStripRenderEventArgs e)
+        {
+            // Intentionally suppress default bottom border line.
         }
     }
 
