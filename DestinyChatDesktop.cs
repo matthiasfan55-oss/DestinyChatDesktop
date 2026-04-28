@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -14,10 +14,14 @@ using Microsoft.Web.WebView2.WinForms;
 
 namespace DestinyChatDesktop
 {
+    internal static class ScriptJson
+    {
+        internal static readonly JavaScriptSerializer Serializer = new JavaScriptSerializer();
+    }
+
     internal static class AgentDebugLog
     {
         private static readonly object Sync = new object();
-        private static readonly JavaScriptSerializer Serializer = new JavaScriptSerializer();
         private static readonly bool Enabled = IsEnabled();
         private static readonly string LogPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -45,7 +49,7 @@ namespace DestinyChatDesktop
                     { "id", Guid.NewGuid().ToString("N") }
                 };
 
-                string line = Serializer.Serialize(payload);
+                string line = ScriptJson.Serializer.Serialize(payload);
                 lock (Sync)
                 {
                     string dir = Path.GetDirectoryName(LogPath);
@@ -139,7 +143,6 @@ namespace DestinyChatDesktop
             AppConfig config = AppConfig.Load(configPath);
             AppState state = AppState.Load(statePath);
             bool runSplitSelfTest = Array.Exists(args, arg => string.Equals(arg, "--self-test-split", StringComparison.OrdinalIgnoreCase));
-            bool runPopoutPauseSelfTest = Array.Exists(args, arg => string.Equals(arg, "--self-test-popout-pause", StringComparison.OrdinalIgnoreCase));
             bool runToolbarSelfTest = Array.Exists(args, arg => string.Equals(arg, "--self-test-toolbar", StringComparison.OrdinalIgnoreCase));
             bool runDualSelfTest = Array.Exists(args, arg => string.Equals(arg, "--self-test-dual", StringComparison.OrdinalIgnoreCase));
             bool runBigscreenGeometrySelfTest = Array.Exists(args, arg => string.Equals(arg, "--self-test-bigscreen-geometry", StringComparison.OrdinalIgnoreCase));
@@ -150,7 +153,168 @@ namespace DestinyChatDesktop
                 File.Delete(selfTestResultPath);
             }
 
-            Application.Run(new MainForm(storageRoot, statePath, config, state, runSplitSelfTest, runPopoutPauseSelfTest, runToolbarSelfTest, runDualSelfTest, runBigscreenGeometrySelfTest, selfTestResultPath));
+            Application.Run(new MainForm(storageRoot, statePath, config, state, runSplitSelfTest, runToolbarSelfTest, runDualSelfTest, runBigscreenGeometrySelfTest, runStreamChatPanelSelfTest, selfTestResultPath));
+        }
+    }
+
+    internal static class KickstinyInjector
+    {
+        private const string KickstinySourceUrl = "https://r2cdn.destiny.gg/kickstiny/kickstiny.user.js";
+        private const string KickstinyCacheFileName = "kickstiny.user.js";
+        private const string UserDownloadsFileName = "Kickstiny- Enhanced Kick Embedded Player-1.2.0.user.js";
+
+        public static async System.Threading.Tasks.Task RegisterAsync(CoreWebView2 coreWebView, string storageRoot)
+        {
+            if (coreWebView == null)
+            {
+                return;
+            }
+
+            string source = await LoadKickstinySourceAsync(storageRoot);
+            if (string.IsNullOrWhiteSpace(source))
+            {
+                return;
+            }
+
+            string wrapper =
+                "(() => {\n" +
+                "  const h = (location.hostname || '').toLowerCase();\n" +
+                "  if (h !== 'kick.com' && h !== 'www.kick.com' && !h.endsWith('.kick.com')) return;\n" +
+                "  if (window.__codexKickstinyLoaderInjected) return;\n" +
+                "  window.__codexKickstinyLoaderInjected = true;\n" +
+                "  const notify = (stage, error) => {\n" +
+                "    try {\n" +
+                "      const host = window.chrome && window.chrome.webview;\n" +
+                "      if (host && typeof host.postMessage === 'function') {\n" +
+                "        host.postMessage({ type: 'codex-kickstiny-status', stage, href: location.href || '', error: error ? String(error && (error.message || error)) : '' });\n" +
+                "      }\n" +
+                "    } catch (_) {}\n" +
+                "  };\n" +
+                "  try {\n" +
+                source + "\n" +
+                "    notify('loaded');\n" +
+                "  } catch (error) {\n" +
+                "    notify('error', error);\n" +
+                "    console.warn('[Codex] Kickstiny injection failed', error);\n" +
+                "  }\n" +
+                "})();";
+
+            await coreWebView.AddScriptToExecuteOnDocumentCreatedAsync(wrapper);
+        }
+
+        private static async System.Threading.Tasks.Task<string> LoadKickstinySourceAsync(string storageRoot)
+        {
+            string cachePath = string.IsNullOrWhiteSpace(storageRoot)
+                ? string.Empty
+                : Path.Combine(storageRoot, KickstinyCacheFileName);
+
+            string downloadsPath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                "Downloads",
+                UserDownloadsFileName);
+
+            string source = TryReadFile(downloadsPath);
+            if (!string.IsNullOrWhiteSpace(source))
+            {
+                TryWriteCache(cachePath, source);
+                return source;
+            }
+
+            source = TryReadFreshCache(cachePath);
+            if (!string.IsNullOrWhiteSpace(source))
+            {
+                return source;
+            }
+
+            try
+            {
+                using (WebClient client = new WebClient())
+                {
+                    client.Headers[HttpRequestHeader.UserAgent] = "DestinyChatDesktop";
+                    source = await client.DownloadStringTaskAsync(KickstinySourceUrl);
+                }
+
+                if (!string.IsNullOrWhiteSpace(source))
+                {
+                    TryWriteCache(cachePath, source);
+                    return source;
+                }
+            }
+            catch (Exception ex)
+            {
+                AgentDebugLog.Write(
+                    "post-fix",
+                    "K1",
+                    "DestinyChatDesktop.cs:KickstinyInjector",
+                    "Unable to load Kickstiny source",
+                    new Dictionary<string, object>
+                    {
+                        { "error", ex.Message },
+                        { "cachePath", cachePath ?? string.Empty },
+                        { "downloadsPath", downloadsPath ?? string.Empty }
+                    });
+            }
+
+            return string.Empty;
+        }
+
+        private static string TryReadFreshCache(string path)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+                {
+                    return string.Empty;
+                }
+
+                FileInfo info = new FileInfo(path);
+                if (DateTime.UtcNow - info.LastWriteTimeUtc > TimeSpan.FromDays(7))
+                {
+                    return string.Empty;
+                }
+
+                return File.ReadAllText(path, Encoding.UTF8);
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }
+
+        private static string TryReadFile(string path)
+        {
+            try
+            {
+                return !string.IsNullOrWhiteSpace(path) && File.Exists(path)
+                    ? File.ReadAllText(path, Encoding.UTF8)
+                    : string.Empty;
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }
+
+        private static void TryWriteCache(string path, string source)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(path) || string.IsNullOrWhiteSpace(source))
+                {
+                    return;
+                }
+
+                string directory = Path.GetDirectoryName(path);
+                if (!string.IsNullOrWhiteSpace(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
+
+                File.WriteAllText(path, source, Encoding.UTF8);
+            }
+            catch
+            {
+            }
         }
     }
 
@@ -198,7 +362,7 @@ namespace DestinyChatDesktop
                     return defaults;
                 }
 
-                JavaScriptSerializer serializer = new JavaScriptSerializer();
+                JavaScriptSerializer serializer = ScriptJson.Serializer;
                 AppConfig config = serializer.Deserialize<AppConfig>(File.ReadAllText(path));
                 if (config == null)
                 {
@@ -294,7 +458,7 @@ namespace DestinyChatDesktop
                     return defaults;
                 }
 
-                JavaScriptSerializer serializer = new JavaScriptSerializer();
+                JavaScriptSerializer serializer = ScriptJson.Serializer;
                 AppState state = serializer.Deserialize<AppState>(File.ReadAllText(path));
                 if (state == null)
                 {
@@ -330,7 +494,7 @@ namespace DestinyChatDesktop
         {
             try
             {
-                JavaScriptSerializer serializer = new JavaScriptSerializer();
+                JavaScriptSerializer serializer = ScriptJson.Serializer;
                 string dir = Path.GetDirectoryName(path);
                 if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
                 {
@@ -394,6 +558,14 @@ namespace DestinyChatDesktop
         private readonly AppState _state;
 
         private readonly ToolStrip _toolStrip;
+        private readonly Panel _captionChromePanel;
+        private readonly Panel _captionDragPanel;
+        private readonly FlowLayoutPanel _captionSysButtonsPanel;
+        private readonly Button _captionMinimizeButton;
+        private readonly Button _captionMaximizeButton;
+        private readonly Button _captionCloseButton;
+        private readonly bool _captionUseMarlettGlyphs;
+        private Rectangle _captionSavedNormalBounds;
         private readonly ToolStripButton _backButton;
         private readonly ToolStripButton _forwardButton;
         private readonly ToolStripButton _homeButton;
@@ -418,8 +590,6 @@ namespace DestinyChatDesktop
         private readonly Button _bigscreenCinemaButton;
         private readonly EmbedViewportPanel _bigscreenEmbedsViewport;
         private readonly WebView2 _bigscreenEmbedsUiView;
-        private readonly FlowLayoutPanel _bigscreenEmbedsPanel;
-        private readonly ToolTip _bigscreenToolTip;
         private readonly WebView2 _bigscreenBarView;
         private readonly WebView2 _webView;
         private readonly Panel _dualChatPanel;
@@ -431,7 +601,6 @@ namespace DestinyChatDesktop
         private bool _isFullScreen;
         private bool _isSavingCookies;
         private bool _bigscreenBarReady;
-        private int _bigscreenEmbedScrollOffset;
         private List<BigscreenEmbedState> _latestBigscreenEmbeds;
         private FormBorderStyle _savedBorderStyle;
         private FormWindowState _savedWindowState;
@@ -439,13 +608,11 @@ namespace DestinyChatDesktop
         private string _pendingNavigation;
         private CoreWebView2Environment _webViewEnvironment;
         private readonly bool _runSplitSelfTest;
-        private readonly bool _runPopoutPauseSelfTest;
         private readonly bool _runToolbarSelfTest;
         private readonly bool _runDualSelfTest;
         private readonly bool _runBigscreenGeometrySelfTest;
         private readonly string _selfTestResultPath;
         private bool _splitSelfTestStarted;
-        private bool _popoutPauseSelfTestStarted;
         private bool _toolbarSelfTestStarted;
         private bool _dualSelfTestStarted;
         private bool _bigscreenGeometrySelfTestStarted;
@@ -479,7 +646,7 @@ namespace DestinyChatDesktop
         private DateTime _lastSnipRequestUtc;
         private bool _treatSnipAsProbe;
 
-        public MainForm(string storageRoot, string statePath, AppConfig config, AppState state, bool runSplitSelfTest, bool runPopoutPauseSelfTest, bool runToolbarSelfTest, bool runDualSelfTest, bool runBigscreenGeometrySelfTest, string selfTestResultPath)
+        public MainForm(string storageRoot, string statePath, AppConfig config, AppState state, bool runSplitSelfTest, bool runToolbarSelfTest, bool runDualSelfTest, bool runBigscreenGeometrySelfTest, bool runStreamChatPanelSelfTest, string selfTestResultPath)
         {
             _storageRoot = storageRoot;
             _statePath = statePath;
@@ -487,15 +654,12 @@ namespace DestinyChatDesktop
             _config = config;
             _state = state;
             _runSplitSelfTest = runSplitSelfTest;
-            _runPopoutPauseSelfTest = runPopoutPauseSelfTest;
             _runToolbarSelfTest = runToolbarSelfTest;
             _runDualSelfTest = runDualSelfTest;
             _runBigscreenGeometrySelfTest = runBigscreenGeometrySelfTest;
-            _runStreamChatPanelSelfTest = Array.Exists(
-                Environment.GetCommandLineArgs(),
-                arg => string.Equals(arg, "--self-test-stream-chat-panel", StringComparison.OrdinalIgnoreCase));
+            _runStreamChatPanelSelfTest = runStreamChatPanelSelfTest;
             _selfTestResultPath = selfTestResultPath ?? string.Empty;
-            _pendingNavigation = (runSplitSelfTest || runPopoutPauseSelfTest || runToolbarSelfTest || runDualSelfTest || runBigscreenGeometrySelfTest || _runStreamChatPanelSelfTest) ? _config.HomeUrl : GetStartupUrl();
+            _pendingNavigation = (runSplitSelfTest || runToolbarSelfTest || runDualSelfTest || runBigscreenGeometrySelfTest || _runStreamChatPanelSelfTest) ? _config.HomeUrl : GetStartupUrl();
             _latestBigscreenEmbeds = new List<BigscreenEmbedState>();
             _dualChatInputTop = 0;
             _dualChatPaneLeft = 0;
@@ -510,6 +674,7 @@ namespace DestinyChatDesktop
             MinimumSize = new Size(900, 640);
             AutoScaleMode = AutoScaleMode.Dpi;
             KeyPreview = true;
+            FormBorderStyle = FormBorderStyle.None;
 
             bool startPinned = _state.LoadedFromDisk ? _state.AlwaysOnTop : _config.StartPinned;
             bool startMuted = _state.LoadedFromDisk ? _state.Muted : _config.StartMuted;
@@ -517,22 +682,28 @@ namespace DestinyChatDesktop
             ApplyInitialWindowBounds();
             TopMost = startPinned;
 
-            _toolStrip = new ToolStrip();
-            _toolStrip.Dock = DockStyle.Top;
+            _toolStrip = new ChromeToolStrip();
             _toolStrip.GripStyle = ToolStripGripStyle.Hidden;
             _toolStrip.RenderMode = ToolStripRenderMode.ManagerRenderMode;
             _toolStrip.Renderer = new BorderlessToolStripRenderer();
             _toolStrip.BackColor = Color.FromArgb(30, 30, 30);
             _toolStrip.ForeColor = Color.White;
-            _toolStrip.Padding = new Padding(6, 4, 6, 4);
-            _toolStrip.AutoSize = false;
-            _toolStrip.Height = 40;
+            _toolStrip.TabStop = false;
+            _toolStrip.Padding = new Padding(6, 0, 6, 0);
+            _toolStrip.AutoSize = true;
+            _toolStrip.CanOverflow = false;
+            _toolStrip.LayoutStyle = ToolStripLayoutStyle.HorizontalStackWithOverflow;
+            _toolStrip.MinimumSize = new Size(0, 40);
+            _toolStrip.Margin = Padding.Empty;
 
-            _backButton = CreateGlyphButton("◀", "Back", OnBackClicked);
-            _forwardButton = CreateGlyphButton("▶", "Forward", OnForwardClicked);
+            _backButton = CreateGlyphButton(ToolbarGlyphKind.Back, "Back", OnBackClicked);
+            _forwardButton = CreateGlyphButton(ToolbarGlyphKind.Forward, "Forward", OnForwardClicked);
             _homeButton = CreateButton("Chat", OnHomeClicked);
             _bigscreenButton = CreateButton("Bigscreen", OnBigscreenClicked);
-            _mediaPopoutButton = CreateGlyphButton("⧉", "Popout media player", OnMediaPopoutClicked);
+            _mediaPopoutButton = CreateGlyphButton(ToolbarGlyphKind.Popout, "Popout media player", OnMediaPopoutClicked);
+            _backButton.Padding = Padding.Empty;
+            _forwardButton.Padding = Padding.Empty;
+            _mediaPopoutButton.Padding = Padding.Empty;
             _loginButton = CreateButton("Login", OnLoginClicked);
             _reloadButton = CreateButton("Reload", OnReloadClicked);
             _updateButton = CreateButton("Update", OnCheckForUpdatesClicked);
@@ -560,6 +731,80 @@ namespace DestinyChatDesktop
             _toolStrip.Items.Add(_zoomOutButton);
             _toolStrip.Items.Add(_zoomResetButton);
             _toolStrip.Items.Add(_zoomInButton);
+            _toolStrip.Layout += OnMainToolStripLayout;
+
+            _captionChromePanel = new ChromePanel();
+            _captionChromePanel.Dock = DockStyle.Top;
+            _captionChromePanel.Height = 40;
+            _captionChromePanel.Margin = Padding.Empty;
+            _captionChromePanel.Padding = Padding.Empty;
+            _captionChromePanel.BackColor = Color.FromArgb(30, 30, 30);
+
+            _captionSysButtonsPanel = new ChromeFlowLayoutPanel();
+            _captionSysButtonsPanel.FlowDirection = FlowDirection.LeftToRight;
+            _captionSysButtonsPanel.WrapContents = false;
+            _captionSysButtonsPanel.AutoSize = true;
+            _captionSysButtonsPanel.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            _captionSysButtonsPanel.Margin = Padding.Empty;
+            _captionSysButtonsPanel.Padding = Padding.Empty;
+            _captionSysButtonsPanel.Height = 40;
+            _captionSysButtonsPanel.MaximumSize = new Size(2000, 40);
+            _captionSysButtonsPanel.BackColor = Color.FromArgb(30, 30, 30);
+
+            bool captionMarlett;
+            Font captionBarFont = CreateCaptionBarFont(11.25f, out captionMarlett);
+            _captionUseMarlettGlyphs = captionMarlett;
+            _captionMinimizeButton = CreateCaptionSystemButton(
+                captionMarlett ? "0" : "\u2212",
+                "Minimize",
+                OnCaptionMinimizeClicked,
+                captionBarFont,
+                false);
+            _captionMaximizeButton = CreateCaptionSystemButton(
+                captionMarlett ? "1" : "\u25A1",
+                "Maximize",
+                OnCaptionMaxRestoreClicked,
+                captionBarFont,
+                false);
+            _captionCloseButton = CreateCaptionSystemButton(
+                captionMarlett ? "r" : "\u2715",
+                "Close",
+                OnCaptionCloseClicked,
+                captionBarFont,
+                true);
+
+            _captionSysButtonsPanel.Controls.Add(_captionMinimizeButton);
+            _captionSysButtonsPanel.Controls.Add(_captionMaximizeButton);
+            _captionSysButtonsPanel.Controls.Add(_captionCloseButton);
+
+            _captionDragPanel = new ChromePanel();
+            _captionDragPanel.Dock = DockStyle.Fill;
+            _captionDragPanel.BackColor = Color.FromArgb(30, 30, 30);
+            _captionDragPanel.MouseDown += OnCaptionDragPanelMouseDown;
+            _captionDragPanel.MouseDoubleClick += OnCaptionDragPanelDoubleClick;
+
+            TableLayoutPanel captionBarLayout = new ChromeTableLayoutPanel();
+            captionBarLayout.Dock = DockStyle.Fill;
+            captionBarLayout.Margin = Padding.Empty;
+            captionBarLayout.Padding = Padding.Empty;
+            captionBarLayout.RowCount = 1;
+            captionBarLayout.ColumnCount = 3;
+            captionBarLayout.GrowStyle = TableLayoutPanelGrowStyle.FixedSize;
+            captionBarLayout.BackColor = Color.FromArgb(30, 30, 30);
+            captionBarLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40f));
+            captionBarLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            captionBarLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+            captionBarLayout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+
+            _toolStrip.Dock = DockStyle.Fill;
+            _captionDragPanel.Dock = DockStyle.Fill;
+            _captionSysButtonsPanel.Dock = DockStyle.Fill;
+
+            captionBarLayout.Controls.Add(_toolStrip, 0, 0);
+            captionBarLayout.Controls.Add(_captionDragPanel, 1, 0);
+            captionBarLayout.Controls.Add(_captionSysButtonsPanel, 2, 0);
+
+            _captionChromePanel.Controls.Add(captionBarLayout);
 
             _statusStrip = new StatusStrip();
             _statusStrip.BackColor = Color.FromArgb(30, 30, 30);
@@ -605,28 +850,10 @@ namespace DestinyChatDesktop
             _bigscreenEmbedsViewport.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
             _bigscreenEmbedsViewport.Margin = new Padding(0);
             _bigscreenEmbedsViewport.BackColor = Color.FromArgb(17, 17, 19);
-            _bigscreenEmbedsViewport.MouseWheel += OnBigscreenEmbedsMouseWheel;
-            _bigscreenEmbedsViewport.MouseEnter += OnBigscreenEmbedsMouseEnter;
-            _bigscreenEmbedsViewport.Resize += OnBigscreenEmbedsResize;
 
             _bigscreenEmbedsUiView = new WebView2();
             _bigscreenEmbedsUiView.Dock = DockStyle.Fill;
             _bigscreenEmbedsUiView.BackColor = Color.FromArgb(17, 17, 19);
-
-            _bigscreenEmbedsPanel = new FlowLayoutPanel();
-            _bigscreenEmbedsPanel.Dock = DockStyle.None;
-            _bigscreenEmbedsPanel.Margin = new Padding(0);
-            _bigscreenEmbedsPanel.Padding = new Padding(8, 4, 8, 4);
-            _bigscreenEmbedsPanel.WrapContents = false;
-            _bigscreenEmbedsPanel.AutoSize = false;
-            _bigscreenEmbedsPanel.FlowDirection = FlowDirection.LeftToRight;
-            _bigscreenEmbedsPanel.BackColor = Color.FromArgb(17, 17, 19);
-            _bigscreenEmbedsPanel.Location = new Point(0, 0);
-
-            _bigscreenToolTip = new ToolTip();
-            _bigscreenToolTip.AutoPopDelay = 8000;
-            _bigscreenToolTip.InitialDelay = 250;
-            _bigscreenToolTip.ReshowDelay = 100;
 
             _bigscreenBarView = new WebView2();
             _bigscreenBarView.Dock = DockStyle.None;
@@ -636,8 +863,6 @@ namespace DestinyChatDesktop
             _bigscreenBarView.Visible = false;
 
             _bigscreenEmbedsViewport.Controls.Add(_bigscreenEmbedsUiView);
-            _bigscreenEmbedsViewport.Controls.Add(_bigscreenEmbedsPanel);
-            _bigscreenEmbedsPanel.Visible = false;
             _bigscreenBarPanel.Controls.Add(_bigscreenEmbedsViewport);
             _bigscreenBarPanel.Controls.Add(_bigscreenControlsPanel);
             _bigscreenControlsPanel.BringToFront();
@@ -678,7 +903,7 @@ namespace DestinyChatDesktop
             Controls.Add(_bigscreenBarPanel);
             Controls.Add(_bigscreenBarView);
             Controls.Add(_statusStrip);
-            Controls.Add(_toolStrip);
+            Controls.Add(_captionChromePanel);
 
             Resize += OnMainFormResize;
             Shown += OnShown;
@@ -686,6 +911,7 @@ namespace DestinyChatDesktop
 
             UpdateNavigationButtons();
             UpdateZoomLabel(_state.ZoomFactor);
+            UpdateCaptionMaxButtonGlyph();
         }
 
         public static double ClampZoom(double zoomFactor)
@@ -755,6 +981,203 @@ namespace DestinyChatDesktop
             return base.ProcessCmdKey(ref msg, keyData);
         }
 
+        [DllImport("user32.dll")]
+        private static extern bool ReleaseCapture();
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int dwAttribute, ref int pvAttribute, int cbAttribute);
+
+        private const int WmNcHitTest = 0x0084;
+        private const int WmNcActivate = 0x0086;
+        private const int WmNclButtonDown = 0x00A1;
+        private const int HtClient = 1;
+        private const int HtCaption = 2;
+        private const int HtLeft = 10;
+        private const int HtRight = 11;
+        private const int HtTop = 12;
+        private const int HtTopLeft = 13;
+        private const int HtTopRight = 14;
+        private const int HtBottom = 15;
+        private const int HtBottomLeft = 16;
+        private const int HtBottomRight = 17;
+        private const int MainFrameResizeBorder = 8;
+        private const int DwmwaUseImmersiveDarkMode = 20;
+        private const int DwmwaBorderColor = 34;
+        private const int DwmwaCaptionColor = 35;
+
+        // FormBorderStyle.None strips frame bits the shell needs for Aero snap, top-edge snap layouts,
+        // and cross-monitor maximize; keep WS_THICKFRAME + min/max/sysmenu without drawing a caption bar.
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                const int WS_THICKFRAME = 0x00040000;
+                const int WS_MINIMIZEBOX = 0x00020000;
+                const int WS_MAXIMIZEBOX = 0x00010000;
+                const int WS_SYSMENU = 0x00080000;
+                cp.Style |= WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU;
+                return cp;
+            }
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            ApplyDwmChromeColors();
+        }
+
+        protected override void OnActivated(EventArgs e)
+        {
+            base.OnActivated(e);
+            ApplyDwmChromeColors();
+            InvalidateCaptionChrome();
+        }
+
+        protected override void OnDeactivate(EventArgs e)
+        {
+            base.OnDeactivate(e);
+            ApplyDwmChromeColors();
+            InvalidateCaptionChrome();
+        }
+
+        private void ApplyDwmChromeColors()
+        {
+            if (!IsHandleCreated)
+            {
+                return;
+            }
+
+            try
+            {
+                int enabled = 1;
+                DwmSetWindowAttribute(Handle, DwmwaUseImmersiveDarkMode, ref enabled, Marshal.SizeOf(typeof(int)));
+
+                int black = 0x000000;
+                DwmSetWindowAttribute(Handle, DwmwaBorderColor, ref black, Marshal.SizeOf(typeof(int)));
+                DwmSetWindowAttribute(Handle, DwmwaCaptionColor, ref black, Marshal.SizeOf(typeof(int)));
+            }
+            catch
+            {
+                // Older Windows builds may not support these DWM attributes.
+            }
+        }
+
+        private void InvalidateCaptionChrome()
+        {
+            if (_toolStrip != null && !_toolStrip.IsDisposed)
+            {
+                _toolStrip.Invalidate();
+            }
+
+            if (_captionChromePanel != null && !_captionChromePanel.IsDisposed)
+            {
+                InvalidateControlTree(_captionChromePanel);
+            }
+        }
+
+        private static void InvalidateControlTree(Control control)
+        {
+            if (control == null || control.IsDisposed)
+            {
+                return;
+            }
+
+            control.Invalidate();
+            foreach (Control child in control.Controls)
+            {
+                InvalidateControlTree(child);
+            }
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WmNcActivate)
+            {
+                base.WndProc(ref m);
+                ApplyDwmChromeColors();
+                return;
+            }
+
+            if (m.Msg == WmNcHitTest
+                && FormBorderStyle == FormBorderStyle.None
+                && !_isFullScreen
+                && WindowState == FormWindowState.Normal)
+            {
+                base.WndProc(ref m);
+
+                if ((int)m.Result == HtClient)
+                {
+                    Point clientPoint = PointToClient(new Point(
+                        (short)(m.LParam.ToInt32() & 0xFFFF),
+                        (short)((m.LParam.ToInt32() >> 16) & 0xFFFF)));
+
+                    int w = ClientSize.Width;
+                    int h = ClientSize.Height;
+                    int b = MainFrameResizeBorder;
+                    bool left = clientPoint.X >= 0 && clientPoint.X <= b;
+                    bool right = clientPoint.X <= w && clientPoint.X >= w - b;
+                    bool top = clientPoint.Y >= 0 && clientPoint.Y <= b;
+                    bool bottom = clientPoint.Y <= h && clientPoint.Y >= h - b;
+
+                    if (left && top)
+                    {
+                        m.Result = (IntPtr)HtTopLeft;
+                        return;
+                    }
+
+                    if (right && top)
+                    {
+                        m.Result = (IntPtr)HtTopRight;
+                        return;
+                    }
+
+                    if (left && bottom)
+                    {
+                        m.Result = (IntPtr)HtBottomLeft;
+                        return;
+                    }
+
+                    if (right && bottom)
+                    {
+                        m.Result = (IntPtr)HtBottomRight;
+                        return;
+                    }
+
+                    if (left)
+                    {
+                        m.Result = (IntPtr)HtLeft;
+                        return;
+                    }
+
+                    if (right)
+                    {
+                        m.Result = (IntPtr)HtRight;
+                        return;
+                    }
+
+                    if (top)
+                    {
+                        m.Result = (IntPtr)HtTop;
+                        return;
+                    }
+
+                    if (bottom)
+                    {
+                        m.Result = (IntPtr)HtBottom;
+                        return;
+                    }
+                }
+
+                return;
+            }
+
+            base.WndProc(ref m);
+        }
+
         private void ApplyInitialWindowBounds()
         {
             Rectangle desiredBounds = new Rectangle(_state.X, _state.Y, _state.Width, _state.Height);
@@ -804,20 +1227,106 @@ namespace DestinyChatDesktop
             return button;
         }
 
-        private ToolStripButton CreateGlyphButton(string glyph, string toolTipText, EventHandler clickHandler)
+        private enum ToolbarGlyphKind
         {
-            ToolStripButton button = CreateButton(glyph, clickHandler);
+            Back,
+            Forward,
+            Popout
+        }
+
+        private ToolStripButton CreateGlyphButton(ToolbarGlyphKind glyph, string toolTipText, EventHandler clickHandler)
+        {
+            ToolStripButton button = CreateButton(string.Empty, clickHandler);
+            button.DisplayStyle = ToolStripItemDisplayStyle.Image;
+            button.Image = CreateToolbarGlyphImage(glyph, Color.FromArgb(230, 232, 236));
+            button.ImageTransparentColor = Color.Transparent;
+            button.ImageScaling = ToolStripItemImageScaling.None;
             button.AutoSize = false;
             button.Width = 28;
             button.Height = 24;
             button.Margin = new Padding(2, 0, 2, 0);
             button.ToolTipText = toolTipText;
-            button.Font = new Font("Segoe UI Symbol", 9.0f, FontStyle.Regular);
-            if (glyph == "◀" || glyph == "▶")
-            {
-                button.Padding = new Padding(0, 0, 0, 2);
-            }
+            button.Tag = "codex-toolbar-glyph";
             return button;
+        }
+
+        private static Bitmap CreateToolbarGlyphImage(ToolbarGlyphKind glyph, Color color)
+        {
+            Bitmap bitmap = new Bitmap(20, 20);
+            using (Graphics graphics = Graphics.FromImage(bitmap))
+            using (Pen pen = new Pen(color, 2.0f))
+            using (SolidBrush brush = new SolidBrush(color))
+            {
+                graphics.Clear(Color.Transparent);
+                graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                pen.StartCap = System.Drawing.Drawing2D.LineCap.Round;
+                pen.EndCap = System.Drawing.Drawing2D.LineCap.Round;
+                pen.LineJoin = System.Drawing.Drawing2D.LineJoin.Round;
+
+                if (glyph == ToolbarGlyphKind.Back || glyph == ToolbarGlyphKind.Forward)
+                {
+                    PointF[] points = glyph == ToolbarGlyphKind.Back
+                        ? new[]
+                        {
+                            new PointF(12.5f, 4.5f),
+                            new PointF(7.0f, 10.0f),
+                            new PointF(12.5f, 15.5f)
+                        }
+                        : new[]
+                        {
+                            new PointF(7.5f, 4.5f),
+                            new PointF(13.0f, 10.0f),
+                            new PointF(7.5f, 15.5f)
+                        };
+                    graphics.DrawLines(pen, points);
+                    return bitmap;
+                }
+
+                graphics.DrawRectangle(pen, 4.5f, 7.5f, 8.0f, 8.0f);
+                graphics.DrawRectangle(pen, 8.5f, 3.5f, 8.0f, 8.0f);
+                graphics.FillPolygon(brush, new[]
+                {
+                    new PointF(12.5f, 3.5f),
+                    new PointF(16.5f, 3.5f),
+                    new PointF(16.5f, 7.5f)
+                });
+            }
+
+            return bitmap;
+        }
+
+        private void OnMainToolStripLayout(object sender, LayoutEventArgs e)
+        {
+            ApplyGlyphToolbarItemHeights();
+        }
+
+        private void ApplyGlyphToolbarItemHeights()
+        {
+            if (_toolStrip == null || !_toolStrip.IsHandleCreated || _toolStrip.IsDisposed)
+            {
+                return;
+            }
+
+            int contentHeight = _toolStrip.DisplayRectangle.Height;
+            if (contentHeight <= 0)
+            {
+                return;
+            }
+
+            if (_backButton != null && _backButton.Height != contentHeight)
+            {
+                _backButton.Height = contentHeight;
+            }
+
+            if (_forwardButton != null && _forwardButton.Height != contentHeight)
+            {
+                _forwardButton.Height = contentHeight;
+            }
+
+            if (_mediaPopoutButton != null && _mediaPopoutButton.Height != contentHeight)
+            {
+                _mediaPopoutButton.Height = contentHeight;
+            }
         }
 
         private ToolStripButton CreateToggleButton(string text, bool isChecked, EventHandler clickHandler)
@@ -901,6 +1410,8 @@ namespace DestinyChatDesktop
                 ConfigureBigscreenEmbedsUiView();
                 await RegisterChatCustomizationAsync();
                 await RegisterChatExtensionsAsync();
+                await KickstinyInjector.RegisterAsync(_webView.CoreWebView2, _storageRoot);
+                await KickstinyInjector.RegisterAsync(_bigscreenEmbedsUiView.CoreWebView2, _storageRoot);
                 await RegisterBigscreenBarCustomizationAsync();
                 await RegisterBigscreenChatLayoutAsync();
                 _bigscreenEmbedsUiView.CoreWebView2.NavigateToString(BuildBigscreenEmbedsHtml(null));
@@ -1246,7 +1757,7 @@ namespace DestinyChatDesktop
 
                 using (WebClient client = CreateGitHubWebClient())
                 {
-                    JavaScriptSerializer serializer = new JavaScriptSerializer();
+                    JavaScriptSerializer serializer = ScriptJson.Serializer;
                     string json = client.DownloadString(apiUrl);
                     object parsed = serializer.DeserializeObject(json);
 
@@ -2085,7 +2596,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             });
                         }
 
-                        // Place only relative to the native focus/eye control — never relative to split chat.
+                        // Place only relative to the native focus/eye control â€” never relative to split chat.
                         // That avoids reorder bugs when Tippy or the site injects nodes between toolbar buttons.
                         const placementOk = btn.parentElement === toolbarRoot
                             && btn.nextElementSibling === anchorBefore;
@@ -3924,7 +4435,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     if (window.__codexExtensionsInjected) return;
                     window.__codexExtensionsInjected = true;
 
-                    // ── Storage helpers ──────────────────────────────────────────
+                    // â”€â”€ Storage helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                     const EXT = 'codex-ext.';
                     function xGet(k, d) {
                         try { const v = localStorage.getItem(EXT + k); return v === null ? d : JSON.parse(v); } catch { return d; }
@@ -3933,7 +4444,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         try { localStorage.setItem(EXT + k, JSON.stringify(v)); } catch {}
                     }
 
-                    // ── Shared WebSocket interceptor ─────────────────────────────
+                    // â”€â”€ Shared WebSocket interceptor â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                     const wsListeners = [];
                     function onWsMsg(cb) { wsListeners.push(cb); }
                     window.__codexEmitWsTest = function(payload) {
@@ -3953,57 +4464,455 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         window.WebSocket = PatchedWS;
                     }
 
-                    // ── Watched-users list (shared by activity + notifications) ──
-                    function getWatched() { return xGet('watchedUsers', ['destiny']); }
-                    function setWatched(arr) { xSet('watchedUsers', arr); }
-                    function isWatched(nick) {
-                        if (!nick) return false;
-                        return getWatched().some(u => u.toLowerCase() === nick.toLowerCase());
+                    // ── DGG Mega Suite-style alerts model ──
+                    function normalizeUserList(input) {
+                        if (Array.isArray(input)) return input.map(s => String(s).trim()).filter(Boolean);
+                        return String(input || '').split(/[\n,]/).map(s => s.trim()).filter(Boolean);
                     }
+                    function shouldTrackNick(nick, mode) {
+                        if (!nick) return false;
+                        if (mode === 'none') return false;
+                        if (mode === 'all')  return true;
+                        const lower = String(nick).toLowerCase();
+                        if (mode === 'custom') {
+                            const arr = xGet('alerts.customUsers', []);
+                            return Array.isArray(arr) && arr.some(u => String(u).toLowerCase() === lower);
+                        }
+                        return lower === 'destiny'; // 'default' list
+                    }
+                    // Back-compat helper used by mention auto-detection (line ~4625).
+                    function getWatched() { return xGet('alerts.notifyUsers', ['destiny']); }
 
-                    // ── Feature 1: User activity tracker (sarkyScript) ───────────
-                    // Inline colour-coded alerts for JOIN / QUIT / UPDATEUSER
-                    function postActivityMsg(nick, type, color, extra) {
-                        if (!xGet('activity.enabled', true)) return;
+                    // DGG Mega Suite-style watched user activity alerts.
+                    const activityLastEmbedByNick = new Map();
+                    function pushActivityHistory(entry) {
+                        try {
+                            const key = EXT + 'activity.history';
+                            const raw = localStorage.getItem(key);
+                            const history = raw ? JSON.parse(raw) : [];
+                            if (Array.isArray(history)) {
+                                history.push(entry);
+                                localStorage.setItem(key, JSON.stringify(history.slice(-250)));
+                            }
+                        } catch {}
+                    }
+                    function formatActivityTimestamp(timestamp) {
+                        const date = new Date(Number(timestamp || Date.now()));
+                        return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                    }
+                    function createActivityMessageElement(entry) {
+                        const container = document.createElement('div');
+                        container.className = 'msg-chat msg-user codex-activity-alert';
+                        container.setAttribute('data-username', String(entry.nick || '').toLowerCase());
+                        container.setAttribute('data-codex-activity-synthetic', '1');
+                        container.setAttribute('data-dgg-mega-synthetic', '1');
+                        container.style.background = entry.color || '#333333';
+                        container.style.color = '#ffffff';
+                        container.style.border = '1px solid rgba(0,0,0,0.2)';
+
+                        const timeNode = document.createElement('time');
+                        timeNode.className = 'time';
+                        timeNode.textContent = formatActivityTimestamp(entry.time);
+                        timeNode.setAttribute('data-unixtimestamp', String(entry.time || Date.now()));
+
+                        const userNode = document.createElement('a');
+                        userNode.className = 'user';
+                        userNode.textContent = entry.nick || '';
+
+                        const ctrlNode = document.createElement('span');
+                        ctrlNode.className = 'ctrl';
+                        ctrlNode.textContent = ': ';
+
+                        const textNode = document.createElement('span');
+                        textNode.className = 'text';
+                        textNode.textContent = entry.type === 'embed' ? 'opened ' : String(entry.text || entry.type || '').toUpperCase();
+
+                        container.append(timeNode, userNode, ctrlNode, textNode);
+
+                        if (entry.type === 'embed' && entry.embed && entry.embed.platform && entry.embed.id) {
+                            const link = document.createElement('a');
+                            link.className = 'externallink bookmarklink';
+                            link.href = 'https://www.destiny.gg/bigscreen#' + entry.embed.platform + '/' + entry.embed.id;
+                            link.textContent = '#' + entry.embed.platform + '/' + entry.embed.id;
+                            link.target = window.top === window.self ? '_blank' : '_top';
+                            container.appendChild(link);
+                        }
+
+                        return container;
+                    }
+                    function appendActivityToChat(entry) {
                         const lines = document.querySelector('.chat-lines');
                         if (!lines) return;
-                        const now = new Date();
-                        const ts = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
-                        let body = '';
-                        if (type === 'JOIN')  body = `${nick} joined`;
-                        else if (type === 'QUIT') body = `${nick} left`;
-                        else if (extra) body = `${nick} watching: ${extra.title || extra.channel || extra.id || '?'} on ${extra.platform || '?'}`;
-                        const el = document.createElement('div');
-                        el.className = 'msg-chat msg-info';
-                        el.style.cssText = `border-left:3px solid ${color};padding-left:6px;opacity:.85;`;
-                        el.innerHTML = `<span class=""time"">${ts}</span> <span class=""text"" style=""color:${color}"">${body}</span>`;
-                        lines.appendChild(el);
-                        lines.scrollTop = lines.scrollHeight;
+                        const shouldStick = lines.scrollHeight - lines.scrollTop - lines.clientHeight < 120;
+                        lines.appendChild(createActivityMessageElement(entry));
+                        if (shouldStick) {
+                            lines.scrollTop = lines.scrollHeight;
+                        }
+                    }
+                    function addActivityEntry(kind, payload) {
+                        const entry = {
+                            type: kind,
+                            nick: payload.nick || payload.user || '',
+                            text: kind,
+                            color: kind === 'join' ? '#1e7a39' : kind === 'quit' ? '#9c2f2f' : '#40255f',
+                            time: Number(payload.timestamp || Date.now()),
+                            embed: payload.embed || null
+                        };
+                        pushActivityHistory(entry);
+                        appendActivityToChat(entry);
+                    }
+                    function parseActivitySocketEnvelope(rawData) {
+                        if (typeof rawData !== 'string') return null;
+                        const separator = rawData.indexOf(' ');
+                        if (separator <= 0) return null;
+                        const prefix = rawData.slice(0, separator);
+                        const json = rawData.slice(separator + 1);
+                        try {
+                            return { prefix, data: JSON.parse(json) };
+                        } catch {
+                            return null;
+                        }
                     }
                     onWsMsg(data => {
-                        if (!xGet('activity.enabled', true)) return;
-                        let type = null, p = null;
-                        if (data.startsWith('JOIN '))       { try { p = JSON.parse(data.slice(5));  type = 'JOIN';       } catch {} }
-                        else if (data.startsWith('QUIT '))  { try { p = JSON.parse(data.slice(5));  type = 'QUIT';       } catch {} }
-                        else if (data.startsWith('UPDATEUSER ')) { try { p = JSON.parse(data.slice(11)); type = 'UPDATEUSER'; } catch {} }
-                        if (!type || !p) return;
-                        const nick = p.nick || p.user;
-                        if (!nick || !isWatched(nick)) return;
-                        if (type === 'JOIN' && xGet('activity.join', true))  postActivityMsg(nick, 'JOIN',  '#22c55e', null);
-                        if (type === 'QUIT' && xGet('activity.quit', true))  postActivityMsg(nick, 'QUIT',  '#ef4444', null);
-                        if (type === 'UPDATEUSER' && xGet('activity.embed', true) && p.watching)
-                            postActivityMsg(nick, 'UPDATEUSER', '#a855f7', p.watching);
+                        const envelope = parseActivitySocketEnvelope(data);
+                        if (!envelope || !envelope.data) return;
+                        const nick = envelope.data.nick || envelope.data.user;
+                        if (!nick) return;
+
+                        if (envelope.prefix === 'JOIN' && shouldTrackNick(nick, xGet('alerts.joinMode', 'default'))) {
+                            addActivityEntry('join', envelope.data);
+                            return;
+                        }
+
+                        if (envelope.prefix === 'QUIT' && shouldTrackNick(nick, xGet('alerts.quitMode', 'default'))) {
+                            addActivityEntry('quit', envelope.data);
+                            return;
+                        }
+
+                        if (envelope.prefix === 'UPDATEUSER' && shouldTrackNick(nick, xGet('alerts.embedMode', 'default')) && envelope.data.watching) {
+                            const embed = envelope.data.watching;
+                            if (!embed || !embed.platform || !embed.id) return;
+                            const loweredNick = String(nick || '').toLowerCase();
+                            const embedKey = embed.platform + '/' + embed.id;
+                            if (activityLastEmbedByNick.get(loweredNick) === embedKey) return;
+                            activityLastEmbedByNick.set(loweredNick, embedKey);
+                            addActivityEntry('embed', {
+                                nick: envelope.data.nick || envelope.data.user,
+                                timestamp: Date.now(),
+                                embed
+                            });
+                        }
                     });
 
-                    // ── Feature 2: Desktop notifications on watched-user messages ─
+                    // ── Desktop notifications on tracked-user messages ──
                     function maybeNotify(nick, text) {
-                        if (!xGet('notifications.enabled', false)) return;
+                        if (!xGet('alerts.desktopNotifications', true)) return;
                         if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+                        const list = xGet('alerts.notifyUsers', ['destiny']);
+                        const lower = String(nick || '').toLowerCase();
+                        if (!Array.isArray(list) || !list.some(u => String(u).toLowerCase() === lower)) return;
                         new Notification(`${nick} said:`, {
                             body: text,
                             icon: 'https://cdn.destiny.gg/2.49.0/emotes/6296cf7e8ccd0.png'
                         });
                     }
+                    function showActivityHistoryDialog() {
+                        let history = [];
+                        try {
+                            const raw = localStorage.getItem(EXT + 'activity.history');
+                            if (raw) history = JSON.parse(raw) || [];
+                        } catch {}
+                        const overlay = document.createElement('div');
+                        overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:99999;display:flex;align-items:center;justify-content:center;';
+                        const box = document.createElement('div');
+                        box.style.cssText = 'background:#1c1c20;color:#e8eaed;width:min(560px,92vw);max-height:80vh;overflow:auto;border:1px solid #2c2f33;border-radius:8px;padding:14px;font:12px/1.4 Segoe UI,sans-serif;';
+                        const head = document.createElement('div');
+                        head.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;';
+                        const title = document.createElement('strong'); title.textContent = 'Activity History';
+                        const closeBtn = document.createElement('button');
+                        closeBtn.textContent = '×';
+                        closeBtn.style.cssText = 'background:none;border:0;color:#fff;font-size:18px;cursor:pointer;';
+                        closeBtn.addEventListener('click', () => overlay.remove());
+                        head.append(title, closeBtn);
+                        box.appendChild(head);
+                        if (!Array.isArray(history) || !history.length) {
+                            const empty = document.createElement('div');
+                            empty.textContent = 'No activity recorded yet.';
+                            empty.style.color = '#888';
+                            box.appendChild(empty);
+                        } else {
+                            history.slice().reverse().forEach(e => {
+                                const row = document.createElement('div');
+                                row.style.cssText = 'padding:4px 6px;border-bottom:1px solid #2a2d31;';
+                                const ts = new Date(Number(e.time || 0)).toLocaleString();
+                                let line = '[' + ts + '] ' + (e.nick || '?') + ' — ' + (e.type || '');
+                                if (e.embed && e.embed.platform && e.embed.id) line += ' (' + e.embed.platform + '/' + e.embed.id + ')';
+                                row.textContent = line;
+                                box.appendChild(row);
+                            });
+                        }
+                        overlay.appendChild(box);
+                        overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+                        document.body.appendChild(overlay);
+                    }
+
+                    // ── DGG Mega Suite-style embeDGG: inline tweet/media/YouTube/Twitch/Kick cards ──
+                    try {
+                    var EMBED_DEFAULTS = {
+                        enableTweets:    true,
+                        enableMedia:     true,
+                        enableYouTube:   true,
+                        enableTwitch:    true,
+                        enableKick:      true,
+                        enableInstagram: true,
+                        mediaWidth:      500,
+                        blurMedia:       false
+                    };
+                    var getEmbedSettings = function() {
+                        return {
+                            enableTweets:    xGet('embeds.enableTweets',    EMBED_DEFAULTS.enableTweets),
+                            enableMedia:     xGet('embeds.enableMedia',     EMBED_DEFAULTS.enableMedia),
+                            enableYouTube:   xGet('embeds.enableYouTube',   EMBED_DEFAULTS.enableYouTube),
+                            enableTwitch:    xGet('embeds.enableTwitch',    EMBED_DEFAULTS.enableTwitch),
+                            enableKick:      xGet('embeds.enableKick',      EMBED_DEFAULTS.enableKick),
+                            enableInstagram: xGet('embeds.enableInstagram', EMBED_DEFAULTS.enableInstagram),
+                            mediaWidth:      Number(xGet('embeds.mediaWidth', EMBED_DEFAULTS.mediaWidth)) || EMBED_DEFAULTS.mediaWidth,
+                            blurMedia:       xGet('embeds.blurMedia',       EMBED_DEFAULTS.blurMedia)
+                        };
+                    };
+                    var applyEmbedRootCss = function() {
+                        var s = getEmbedSettings();
+                        document.documentElement.style.setProperty('--codex-embed-width', s.mediaWidth + 'px');
+                        document.documentElement.classList.toggle('codex-embed-blur', !!s.blurMedia);
+                    };
+                    (function injectEmbedStyle() {
+                        if (document.getElementById('codex-embed-style')) return;
+                        const style = document.createElement('style');
+                        style.id = 'codex-embed-style';
+                        style.textContent = [
+                            '.codex-embed-card { display:block; max-width:var(--codex-embed-width,500px); margin:6px 0 4px; border:1px solid #2a2a2a; border-radius:6px; overflow:hidden; background:#0e0e12; }',
+                            '.codex-embed-card img, .codex-embed-card video { display:block; width:100%; height:auto; }',
+                            '.codex-embed-card iframe { display:block; width:100%; aspect-ratio:16/9; border:0; }',
+                            '.codex-embed-meta { padding:6px 8px; font-size:11px; color:#cfd3dc; line-height:1.3; }',
+                            '.codex-embed-meta .codex-embed-title { font-weight:600; }',
+                            '.codex-embed-meta .codex-embed-source { color:#7e8590; font-size:10px; margin-top:2px; }',
+                            '.codex-embed-clickable { cursor:pointer; }',
+                            '.codex-embed-clickable:hover { border-color:#3d4250; }',
+                            '.codex-embed-blur .codex-embed-card img, .codex-embed-blur .codex-embed-card video { filter:blur(20px); transition:filter .2s; }',
+                            '.codex-embed-blur .codex-embed-card:hover img, .codex-embed-blur .codex-embed-card:hover video { filter:none; }',
+                            '.codex-embed-stub { padding:8px 10px; font-size:11px; color:#9aa0aa; }',
+                            '.codex-embed-stub .codex-embed-title { color:#cfd3dc; font-weight:600; margin-bottom:2px; }'
+                        ].join('\n');
+                        (document.head || document.documentElement).appendChild(style);
+                    })();
+                    applyEmbedRootCss();
+
+                    function classifyEmbed(rawUrl) {
+                        let parsed;
+                        try { parsed = new URL(rawUrl); } catch { return null; }
+                        if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null;
+                        const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
+                        const path = parsed.pathname || '';
+                        if (host === 'youtube.com' || host === 'm.youtube.com' || host === 'youtu.be') {
+                            let id = '';
+                            if (host === 'youtu.be') id = path.slice(1).split('/')[0] || '';
+                            else if (path === '/watch') id = parsed.searchParams.get('v') || '';
+                            else if (path.startsWith('/shorts/')) id = path.split('/')[2] || '';
+                            else if (path.startsWith('/embed/')) id = path.split('/')[2] || '';
+                            else if (path.startsWith('/live/')) id = path.split('/')[2] || '';
+                            if (id && /^[A-Za-z0-9_-]{6,}$/.test(id)) return { type:'youtube', id, url:rawUrl };
+                        }
+                        if (host === 'clips.twitch.tv') {
+                            const slug = path.replace(/^\/+/, '').split('/')[0];
+                            if (slug) return { type:'twitch-clip', id:slug, url:rawUrl };
+                        }
+                        if (host === 'twitch.tv') {
+                            const vodMatch = path.match(/^\/videos\/(\d+)/);
+                            if (vodMatch) return { type:'twitch-vod', id:vodMatch[1], url:rawUrl };
+                            const clipMatch = path.match(/^\/[^/]+\/clip\/([A-Za-z0-9_-]+)/);
+                            if (clipMatch) return { type:'twitch-clip', id:clipMatch[1], url:rawUrl };
+                            const chMatch = path.match(/^\/([A-Za-z0-9_]{3,})\/?$/);
+                            const reservedTwitch = ['videos','directory','search','settings','subscriptions','wallet','inventory','drops','jobs'];
+                            if (chMatch && reservedTwitch.indexOf(chMatch[1].toLowerCase()) < 0) {
+                                return { type:'twitch', id:chMatch[1], url:rawUrl };
+                            }
+                        }
+                        if (host === 'kick.com') {
+                            const m = path.match(/^\/([A-Za-z0-9_-]{2,})\/?$/);
+                            const reservedKick = ['popout','user','category','clips','videos','help','dashboard','login','signup','search','browse','about'];
+                            if (m && reservedKick.indexOf(m[1].toLowerCase()) < 0) {
+                                return { type:'kick', id:m[1], url:rawUrl };
+                            }
+                        }
+                        if (host === 'twitter.com' || host === 'x.com' || host === 'fxtwitter.com' || host === 'vxtwitter.com' || host === 'fixupx.com') {
+                            const m = path.match(/\/status\/(\d+)/);
+                            if (m) return { type:'tweet', id:m[1], url:rawUrl };
+                        }
+                        if (host === 'instagram.com' || host === 'ddinstagram.com') {
+                            if (/^\/(p|reel|tv)\//.test(path)) return { type:'instagram', url:rawUrl };
+                        }
+                        if (/\.(jpe?g|png|gif|webp|bmp|svg)(?:$|\?|#)/i.test(path)) return { type:'image', url:rawUrl };
+                        if (/\.(mp4|webm|mov|m4v|ogv)(?:$|\?|#)/i.test(path)) return { type:'video', url:rawUrl };
+                        return null;
+                    }
+                    function buildEmbedCard(info) {
+                        const s = getEmbedSettings();
+                        const card = document.createElement('div');
+                        card.className = 'codex-embed-card';
+                        card.setAttribute('data-codex-embed-type', info.type);
+                        if (info.type === 'image') {
+                            if (!s.enableMedia) return null;
+                            const img = document.createElement('img');
+                            img.src = info.url; img.loading = 'lazy'; img.referrerPolicy = 'no-referrer';
+                            card.appendChild(img); return card;
+                        }
+                        if (info.type === 'video') {
+                            if (!s.enableMedia) return null;
+                            const v = document.createElement('video');
+                            v.src = info.url; v.controls = true; v.loop = true; v.muted = true; v.preload = 'metadata';
+                            card.appendChild(v); return card;
+                        }
+                        if (info.type === 'youtube') {
+                            if (!s.enableYouTube) return null;
+                            const thumb = document.createElement('img');
+                            thumb.src = 'https://i.ytimg.com/vi/' + info.id + '/hqdefault.jpg';
+                            thumb.loading = 'lazy'; thumb.referrerPolicy = 'no-referrer';
+                            card.appendChild(thumb);
+                            const meta = document.createElement('div'); meta.className = 'codex-embed-meta';
+                            const title = document.createElement('div'); title.className = 'codex-embed-title'; title.textContent = 'YouTube video';
+                            const src = document.createElement('div'); src.className = 'codex-embed-source'; src.textContent = 'youtube.com · ' + info.id;
+                            meta.appendChild(title); meta.appendChild(src);
+                            card.appendChild(meta);
+                            card.classList.add('codex-embed-clickable');
+                            card.addEventListener('click', () => { try { window.open(info.url, '_blank', 'noopener'); } catch {} });
+                            try {
+                                fetch('https://www.youtube.com/oembed?format=json&url=' + encodeURIComponent(info.url), { credentials: 'omit' })
+                                    .then(r => r.ok ? r.json() : null)
+                                    .then(j => { if (j && j.title) title.textContent = j.title; if (j && j.author_name) src.textContent = 'YouTube · ' + j.author_name; })
+                                    .catch(() => {});
+                            } catch {}
+                            return card;
+                        }
+                        if (info.type === 'twitch' || info.type === 'twitch-vod' || info.type === 'twitch-clip') {
+                            if (!s.enableTwitch) return null;
+                            const f = document.createElement('iframe');
+                            const parent = (location.hostname || 'destiny.gg');
+                            if (info.type === 'twitch-clip') {
+                                f.src = 'https://clips.twitch.tv/embed?clip=' + encodeURIComponent(info.id) + '&parent=' + encodeURIComponent(parent) + '&autoplay=false';
+                            } else if (info.type === 'twitch-vod') {
+                                f.src = 'https://player.twitch.tv/?video=' + encodeURIComponent(info.id) + '&parent=' + encodeURIComponent(parent) + '&autoplay=false';
+                            } else {
+                                f.src = 'https://player.twitch.tv/?channel=' + encodeURIComponent(info.id) + '&parent=' + encodeURIComponent(parent) + '&autoplay=false';
+                            }
+                            f.allow = 'autoplay; fullscreen; picture-in-picture';
+                            f.referrerPolicy = 'no-referrer';
+                            card.appendChild(f); return card;
+                        }
+                        if (info.type === 'kick') {
+                            if (!s.enableKick) return null;
+                            const f = document.createElement('iframe');
+                            f.src = 'https://player.kick.com/' + encodeURIComponent(info.id) + '?autoplay=false';
+                            f.allow = 'autoplay; fullscreen; picture-in-picture';
+                            f.referrerPolicy = 'no-referrer';
+                            card.appendChild(f); return card;
+                        }
+                        if (info.type === 'tweet') {
+                            if (!s.enableTweets) return null;
+                            const stub = document.createElement('div'); stub.className = 'codex-embed-stub';
+                            const t = document.createElement('div'); t.className = 'codex-embed-title'; t.textContent = 'Tweet (' + info.id + ')';
+                            const sub = document.createElement('div'); sub.className = 'codex-embed-source'; sub.textContent = 'Inline preview unavailable — click link to open. (Full tweet rendering needs a host fetch bridge.)';
+                            stub.appendChild(t); stub.appendChild(sub);
+                            card.appendChild(stub); return card;
+                        }
+                        if (info.type === 'instagram') {
+                            if (!s.enableInstagram) return null;
+                            const stub = document.createElement('div'); stub.className = 'codex-embed-stub';
+                            const t = document.createElement('div'); t.className = 'codex-embed-title'; t.textContent = 'Instagram post';
+                            const sub = document.createElement('div'); sub.className = 'codex-embed-source'; sub.textContent = 'Inline preview unavailable — click link to open. (Instagram blocks cross-origin metadata.)';
+                            stub.appendChild(t); stub.appendChild(sub);
+                            card.appendChild(stub); return card;
+                        }
+                        return null;
+                    }
+                    var __URL_RE = /https?:\/\/[^\s""'<>\]) -]{4,}/gi;
+                    var processChatMessageForEmbeds = function(msg) {
+                        if (!(msg instanceof HTMLElement)) return;
+                        if (msg.dataset && msg.dataset.codexEmbedProcessed) return;
+                        if (msg.dataset) msg.dataset.codexEmbedProcessed = '1';
+                        var parent = msg.parentNode;
+                        var nextSib = msg.nextSibling;
+                        var seen = {};
+                        var cards = [];
+                        // Pass 1: anchor[href] elements
+                        var links = msg.querySelectorAll('a[href]');
+                        for (var li = 0; li < links.length; li++) {
+                            var href = '';
+                            try { href = links[li].href || links[li].getAttribute('href') || ''; } catch(ex) { continue; }
+                            if (!href || seen[href]) continue;
+                            seen[href] = 1;
+                            var info = classifyEmbed(href);
+                            if (!info) continue;
+                            var card = buildEmbedCard(info);
+                            if (card) cards.push(card);
+                        }
+                        // Pass 2: plain-text URL scan (catches URLs destiny.gg renders without <a> wrapping)
+                        if (cards.length === 0) {
+                            var textEl = msg.querySelector('.text') || msg;
+                            var rawText = textEl.textContent || '';
+                            var m2;
+                            __URL_RE.lastIndex = 0;
+                            while ((m2 = __URL_RE.exec(rawText)) !== null) {
+                                var rawUrl = m2[0].replace(/[.,;:!?)]+$/, '');
+                                if (seen[rawUrl]) continue;
+                                seen[rawUrl] = 1;
+                                var info2 = classifyEmbed(rawUrl);
+                                if (!info2) continue;
+                                var card2 = buildEmbedCard(info2);
+                                if (card2) cards.push(card2);
+                            }
+                        }
+                        // Insert cards as siblings AFTER msg (not inside it — msg CSS clips children)
+                        for (var ci = 0; ci < cards.length; ci++) {
+                            cards[ci].setAttribute('data-codex-embed-for', msg.getAttribute('data-id') || '');
+                            if (parent) {
+                                parent.insertBefore(cards[ci], nextSib);
+                                nextSib = cards[ci].nextSibling;
+                            } else {
+                                msg.appendChild(cards[ci]);
+                            }
+                        }
+                    };
+                    var attachEmbedObserver = function() {
+                        var lines = document.querySelector('.chat-lines');
+                        if (!lines) return false;
+                        if (lines.dataset && lines.dataset.codexEmbedObserved) return true;
+                        if (lines.dataset) lines.dataset.codexEmbedObserved = '1';
+                        var existing = lines.querySelectorAll('.msg-chat');
+                        for (var i = 0; i < existing.length; i++) processChatMessageForEmbeds(existing[i]);
+                        var mo = new MutationObserver(function(records) {
+                            for (var ri = 0; ri < records.length; ri++) {
+                                var added = records[ri].addedNodes;
+                                for (var ni = 0; ni < added.length; ni++) {
+                                    var n = added[ni];
+                                    if (!(n instanceof HTMLElement)) continue;
+                                    if (n.classList && (n.classList.contains('msg-chat') || n.classList.contains('msg-user'))) {
+                                        processChatMessageForEmbeds(n);
+                                    } else {
+                                        var nested = n.querySelectorAll ? n.querySelectorAll('.msg-chat, .msg-user') : [];
+                                        for (var nni = 0; nni < nested.length; nni++) processChatMessageForEmbeds(nested[nni]);
+                                    }
+                                }
+                            }
+                        });
+                        mo.observe(lines, { childList: true, subtree: true });
+                        return true;
+                    };
+                    if (!attachEmbedObserver()) {
+                        var __codexEmbedRetry = setInterval(function () { if (attachEmbedObserver()) clearInterval(__codexEmbedRetry); }, 1000);
+                        setTimeout(function () { clearInterval(__codexEmbedRetry); }, 60000);
+                    }
+                    } catch (e) { try { console.error('codex embed setup failed:', e); } catch (_) {} }
+
                     let mentionDingAudioCtx = null;
                     let lastMentionDingAt = 0;
                     function normalizeNickValue(value) {
@@ -4075,6 +4984,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             for (const m of muts) {
                                 for (const n of m.addedNodes) {
                                     if (!(n instanceof Element) || !n.classList.contains('msg-user')) continue;
+                                    if (n.getAttribute('data-codex-activity-synthetic') === '1') continue;
                                     const nick = n.getAttribute('data-username') || '';
                                     if (isWatched(nick)) {
                                         maybeNotify(nick, n.querySelector('.text')?.textContent?.trim() || '');
@@ -4087,7 +4997,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         }).observe(lines, { childList: true });
                     }
 
-                    // ── Feature 3: DinkDonk button ───────────────────────────────
+                    // â”€â”€ Feature 3: DinkDonk button â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                     let ddTimer = null;
                     let ddLastAutoOpenUrl = '';
                     let ddLastAutoOpenAt = 0;
@@ -4193,7 +5103,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         }).observe(lines, { childList: true, subtree: true });
                     }
 
-                    // ── Feature 4: External chat side panel (Kick / YouTube) ──────
+                    // â”€â”€ Feature 4: External chat side panel (Kick / YouTube) â”€â”€â”€â”€â”€â”€
                     function getSplitChatApi() {
                         return window.__codexSplitChatApi || null;
                     }
@@ -4225,82 +5135,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         return document.getElementById('codex-stream-chat-btn');
                     }
 
-                    const EXT_PANEL = 'codex-ext-panel';
-                    const PANEL_MIN = 240, PANEL_MAX = 700;
-                    function extSrc(url) {
-                        const u = (url || '').trim();
-                        if (u.startsWith('#kick/'))    return 'https://kick.com/popout/' + u.slice(6) + '/chat';
-                        if (u.startsWith('#youtube/')) return 'https://www.youtube.com/live_chat?v=' + encodeURIComponent(u.slice(9)) + '&embed_domain=' + encodeURIComponent(location.hostname || 'www.destiny.gg');
-                        if (u.startsWith('http'))      return u;
-                        return '';
-                    }
-                    function openExtPanel() {
-                        let panel = document.getElementById(EXT_PANEL);
-                        const src = extSrc(xGet('externalChat.url', ''));
-                        if (!src) return false;
-                        if (!panel) {
-                            const w = Math.max(PANEL_MIN, Math.min(PANEL_MAX, xGet('externalChat.width', 340)));
-                            panel = document.createElement('div');
-                            panel.id = EXT_PANEL;
-                            panel.style.cssText = `position:fixed;top:0;right:0;bottom:0;width:${w}px;display:flex;flex-direction:column;background:#18181b;z-index:8888;box-shadow:-2px 0 8px rgba(0,0,0,.4);`;
-                            const hdr = document.createElement('div');
-                            hdr.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:4px 8px;background:#111;border-bottom:1px solid #2a2a2a;flex-shrink:0;';
-                            const lbl = document.createElement('span');
-                            lbl.style.cssText = 'font-size:10px;color:#666;';
-                            lbl.textContent = 'External Chat';
-                            const xbtn = document.createElement('button');
-                            xbtn.textContent = '✕';
-                            xbtn.style.cssText = 'background:none;border:none;color:#666;cursor:pointer;font-size:11px;padding:0 4px;';
-                            xbtn.addEventListener('click', () => closeExtPanel());
-                            hdr.appendChild(lbl);
-                            hdr.appendChild(xbtn);
-                            const iframe = document.createElement('iframe');
-                            iframe.src = src;
-                            iframe.style.cssText = 'flex:1;width:100%;border:none;min-height:0;';
-                            const handle = document.createElement('div');
-                            handle.style.cssText = 'position:absolute;left:0;top:0;bottom:0;width:5px;cursor:col-resize;';
-                            handle.addEventListener('mouseenter', () => handle.style.background = 'rgba(255,255,255,.1)');
-                            handle.addEventListener('mouseleave', () => handle.style.background = '');
-                            handle.addEventListener('mousedown', e => {
-                                e.preventDefault();
-                                const sx = e.clientX, sw = panel.offsetWidth;
-                                const mv = e2 => { const nw = Math.max(PANEL_MIN, Math.min(PANEL_MAX, sw + sx - e2.clientX)); panel.style.width = nw + 'px'; xSet('externalChat.width', nw); };
-                                const up = () => { document.removeEventListener('mousemove', mv); document.removeEventListener('mouseup', up); };
-                                document.addEventListener('mousemove', mv);
-                                document.addEventListener('mouseup', up);
-                            });
-                            panel.appendChild(handle);
-                            panel.appendChild(hdr);
-                            panel.appendChild(iframe);
-                            document.body.appendChild(panel);
-                        } else {
-                            panel.style.display = 'flex';
-                            const iframe = panel.querySelector('iframe');
-                            if (iframe && iframe.src !== src) iframe.src = src;
-                        }
-                        xSet('externalChat.open', true);
-                        syncExtBtn(true);
-                        return true;
-                    }
-                    function closeExtPanel() {
-                        const p = document.getElementById(EXT_PANEL);
-                        if (p) p.style.display = 'none';
-                        xSet('externalChat.open', false);
-                        syncExtBtn(false);
-                    }
-                    window.__codexCloseExtPanel = closeExtPanel;
-                    function syncExtBtn(open) {
-                        const btn = document.getElementById('codex-ext-panel-btn');
-                        if (btn) btn.classList.toggle('codex-split-chat-active', !!open);
-                    }
-                    function removeExtPanelBtn() {
-                        const btn = document.getElementById('codex-ext-panel-btn');
-                        if (btn && btn.parentElement) {
-                            btn.parentElement.removeChild(btn);
-                        }
-                    }
-
-                    // ── Feature 5: Double-click username → append to chat input ───
+                    // â”€â”€ Feature 5: Double-click username â†’ append to chat input â”€â”€
                     document.addEventListener('dblclick', e => {
                         if (!xGet('chatInput.doubleClick', false)) return;
                         const el = e.target;
@@ -4315,7 +5150,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         ta.focus();
                     }, true);
 
-                    // ── Feature 6: Custom phrase highlights on chat input ─────────
+                    // â”€â”€ Feature 6: Custom phrase highlights on chat input â”€â”€â”€â”€â”€â”€â”€â”€â”€
                     let lastPhraseColor = null;
                     function checkPhraseColor(text) {
                         if (!xGet('phrases.enabled', true)) return null;
@@ -4338,7 +5173,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         });
                     }
 
-                    // ── Feature 7: Hidden phrases (hide messages containing them) ─
+                    // â”€â”€ Feature 7: Hidden phrases (hide messages containing them) â”€
                     function setupHiddenPhrases() {
                         const lines = document.querySelector('.chat-lines');
                         if (!lines) return;
@@ -4356,7 +5191,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         }).observe(lines, { childList: true });
                     }
 
-                    // ── Feature 8: Image paste → upload to femboy.beauty ─────────
+                    // â”€â”€ Feature 8: Image paste â†’ upload to femboy.beauty â”€â”€â”€â”€â”€â”€â”€â”€â”€
                     function setupImageUpload() {
                         document.addEventListener('paste', async e => {
                             if (!xGet('imageUpload.enabled', false)) return;
@@ -4391,7 +5226,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         });
                     }
 
-                    // ── Settings panel ────────────────────────────────────────────
+                    // â”€â”€ Settings panel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                     const SETT_ID = 'codex-ext-settings';
                     function ensureSettingsStyles() {
                         if (document.getElementById('codex-ext-styles')) return;
@@ -4399,11 +5234,15 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         s.id = 'codex-ext-styles';
                         s.textContent = `
                             #${SETT_ID} {
-                                position:absolute; bottom:0; left:0; right:0;
+                                position:fixed; right:8px; bottom:var(--codex-ext-settings-bottom, 104px);
+                                width:min(360px, calc(100vw - 12px));
+                                max-width:calc(100vw - 12px);
+                                height:420px;
                                 z-index:200; background:#141418;
-                                border-top:1px solid #2a2a2a;
+                                border:1px solid #2a2a2a;
+                                box-shadow:0 12px 28px rgba(0,0,0,.42);
                                 display:none; flex-direction:column;
-                                max-height:65%;
+                                box-sizing:border-box;
                             }
                             #${SETT_ID}.active { display:flex; }
                             #${SETT_ID} .xs-bar {
@@ -4414,7 +5253,15 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             #${SETT_ID} .xs-bar h5 { margin:0; font-size:11px; color:#999; font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
                             #${SETT_ID} .xs-close { background:none; border:none; color:#666; cursor:pointer; font-size:13px; padding:0 4px; line-height:1; }
                             #${SETT_ID} .xs-close:hover { color:#fff; }
-                            #${SETT_ID} .xs-body { overflow-y:auto; flex:1; padding:6px 10px 10px; }
+                            #${SETT_ID} .xs-body { overflow:hidden; flex:1; display:flex; flex-direction:column; min-height:0; }
+                            #${SETT_ID} .xs-tabs { display:flex; gap:2px; padding:6px 8px 0; background:#101014; border-bottom:1px solid #25252b; flex-shrink:0; overflow-x:auto; scrollbar-width:thin; }
+                            #${SETT_ID} .xs-tab { appearance:none; border:1px solid transparent; border-bottom:0; background:transparent; color:#8a8f98; cursor:pointer; font-size:11px; font-weight:700; padding:6px 10px; border-radius:5px 5px 0 0; white-space:nowrap; }
+                            #${SETT_ID} .xs-tab:hover { color:#d6d8de; background:#18181e; }
+                            #${SETT_ID} .xs-tab.active { color:#f1f3f7; background:#1d1d24; border-color:#30303a; }
+                            #${SETT_ID} .xs-pages { overflow-y:auto; flex:1; min-height:0; padding:8px 10px 10px; }
+                            #${SETT_ID} .xs-page[hidden] { display:none !important; }
+                            #${SETT_ID} .xs-group { border:1px solid #292932; background:#17171d; border-radius:6px; padding:8px; margin:0 0 8px; }
+                            #${SETT_ID} .xs-group h6 { margin:0 0 7px; font-size:10px; color:#8d929c; font-weight:800; text-transform:uppercase; letter-spacing:.05em; }
                             #${SETT_ID} .xs-section { font-size:9px; color:#555; text-transform:uppercase; font-weight:700; letter-spacing:.06em; margin:10px 0 4px; padding-bottom:3px; border-bottom:1px solid #222; }
                             #${SETT_ID} .xs-section:first-child { margin-top:2px; }
                             #${SETT_ID} .xs-row { display:flex; align-items:center; gap:6px; margin:3px 0; }
@@ -4433,10 +5280,49 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             #${SETT_ID} .xs-add:hover { color:#fff; border-color:#555; }
                             #${SETT_ID} textarea.xs-ta { width:100%; background:#0e0e12; border:1px solid #2a2a2a; color:#ccc; border-radius:3px; padding:4px 6px; font-size:11px; resize:vertical; min-height:52px; box-sizing:border-box; font-family:inherit; }
                             #${SETT_ID} textarea.xs-ta:focus { outline:none; border-color:#444; }
+                            #${SETT_ID} select.xs-select { flex:1; background:#0e0e12; border:1px solid #2a2a2a; color:#ccc; border-radius:3px; padding:3px 6px; font-size:11px; font-family:inherit; min-width:0; appearance:none; -webkit-appearance:none; background-image:linear-gradient(45deg, transparent 50%, #888 50%), linear-gradient(135deg, #888 50%, transparent 50%); background-position:calc(100% - 12px) 50%, calc(100% - 7px) 50%; background-size:5px 5px, 5px 5px; background-repeat:no-repeat; padding-right:22px; }
+                            #${SETT_ID} select.xs-select:focus { outline:none; border-color:#444; }
+                            #${SETT_ID} select.xs-select option { background:#0e0e12; color:#ccc; }
+                            #${SETT_ID} button.xs-btn { background:#1a1a1f; border:1px solid #333; color:#cfd3dc; cursor:pointer; border-radius:3px; padding:5px 10px; font-size:11px; font-family:inherit; font-weight:600; }
+                            #${SETT_ID} button.xs-btn:hover { color:#fff; border-color:#555; background:#22222a; }
+                            #${SETT_ID} button.xs-btn:active { background:#15151a; }
+                            #${SETT_ID} .xs-row-stacked { display:flex; flex-direction:column; align-items:stretch; gap:3px; margin:5px 0; }
+                            #${SETT_ID} .xs-row-stacked > label { font-size:11px; color:#9aa0aa; font-weight:600; flex:none; min-width:0; cursor:default; }
+                            #${SETT_ID} .xs-row-actions { display:flex; flex-wrap:wrap; gap:6px; margin:6px 0 2px; }
+                            #${SETT_ID} .xs-note { color:#777; font-size:10.5px; padding:2px 2px 4px; }
+                            #${SETT_ID} input[type=range].xs-range { accent-color:#5b7fa6; height:18px; background:transparent; cursor:pointer; }
                             #codex-ext-settings-btn.codex-split-chat-active { opacity:1 !important; }
                             #codex-ext-settings-btn .btn-icon,
-                            #codex-ext-panel-btn .btn-icon,
-                            #codex-snip-btn .btn-icon { opacity:1 !important; }
+                            #codex-snip-btn .btn-icon {
+                                opacity:1 !important;
+                                width:18px !important;
+                                height:18px !important;
+                                color:#cfd3dc !important;
+                                background:none !important;
+                                font-size:0 !important;
+                                line-height:0 !important;
+                                display:flex !important;
+                                align-items:center !important;
+                                justify-content:center !important;
+                            }
+                            #codex-ext-settings-btn .btn-icon svg,
+                            #codex-snip-btn .btn-icon svg {
+                                display:block !important;
+                                width:18px !important;
+                                height:18px !important;
+                                stroke:#cfd3dc !important;
+                                fill:none !important;
+                                pointer-events:none !important;
+                            }
+                            #codex-ext-settings-btn:hover .btn-icon,
+                            #codex-snip-btn:hover .btn-icon { color:#fff !important; }
+                            #codex-ext-settings-btn:hover .btn-icon svg,
+                            #codex-snip-btn:hover .btn-icon svg { stroke:#fff !important; }
+                            @media (max-height: 420px) {
+                                #${SETT_ID} { height:calc(100vh - var(--codex-ext-settings-bottom, 104px) - 8px); }
+                                #${SETT_ID} .xs-bar { padding:4px 8px; }
+                                #${SETT_ID} .xs-tab { padding:5px 8px; }
+                            }
                         `;
                         (document.head || document.documentElement).appendChild(s);
                     }
@@ -4459,6 +5345,90 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         row.appendChild(chk); row.appendChild(lbl);
                         return row;
                     }
+                    function mkGroup(title) {
+                        const group = document.createElement('div');
+                        group.className = 'xs-group';
+                        const heading = document.createElement('h6');
+                        heading.textContent = title;
+                        group.appendChild(heading);
+                        return group;
+                    }
+                    function mkSelectRow(label, key, def, options) {
+                        const row = document.createElement('div'); row.className = 'xs-row-stacked';
+                        const lbl = document.createElement('label');
+                        lbl.textContent = label;
+                        const sel = document.createElement('select');
+                        sel.className = 'xs-select';
+                        options.forEach(opt => {
+                            const o = document.createElement('option');
+                            o.value = opt.value; o.textContent = opt.label;
+                            sel.appendChild(o);
+                        });
+                        sel.value = xGet(key, def);
+                        sel.addEventListener('change', () => xSet(key, sel.value));
+                        row.appendChild(lbl); row.appendChild(sel);
+                        return row;
+                    }
+                    function mkUserListRow(label, key, defaultArr, placeholder) {
+                        const row = document.createElement('div'); row.className = 'xs-row-stacked';
+                        const lbl = document.createElement('label');
+                        lbl.textContent = label;
+                        const ta = document.createElement('textarea');
+                        ta.className = 'xs-ta';
+                        if (placeholder) ta.placeholder = placeholder;
+                        const stored = xGet(key, defaultArr);
+                        ta.value = (Array.isArray(stored) ? stored : []).join(', ');
+                        ta.addEventListener('input', () => xSet(key, normalizeUserList(ta.value)));
+                        row.appendChild(lbl); row.appendChild(ta);
+                        return row;
+                    }
+                    function createTabbedPages(names) {
+                        const tabs = document.createElement('div');
+                        tabs.className = 'xs-tabs';
+                        const pages = document.createElement('div');
+                        pages.className = 'xs-pages';
+                        const map = new Map();
+                        function activate(name) {
+                            map.forEach((entry, key) => {
+                                const active = key === name;
+                                entry.button.classList.toggle('active', active);
+                                entry.button.setAttribute('aria-selected', active ? 'true' : 'false');
+                                entry.page.hidden = !active;
+                            });
+                        }
+                        names.forEach((name, index) => {
+                            const button = document.createElement('button');
+                            button.className = 'xs-tab';
+                            button.type = 'button';
+                            button.textContent = name;
+                            button.setAttribute('role', 'tab');
+                            const page = document.createElement('div');
+                            page.className = 'xs-page';
+                            page.hidden = index !== 0;
+                            button.addEventListener('click', () => activate(name));
+                            tabs.appendChild(button);
+                            pages.appendChild(page);
+                            map.set(name, { button, page });
+                        });
+                        if (names.length) activate(names[0]);
+                        return { tabs, pages, map };
+                    }
+                    function updateSettingsPanelPosition() {
+                        const panel = document.getElementById(SETT_ID);
+                        if (!panel) return;
+                        const anchor = document.querySelector('#chat-input-wrap')
+                            || document.querySelector('#chat-input-frame')
+                            || document.querySelector('#chat-input-control')
+                            || document.querySelector('.chat-input');
+                        let bottom = 104;
+                        if (anchor && typeof anchor.getBoundingClientRect === 'function') {
+                            const rect = anchor.getBoundingClientRect();
+                            if (rect && Number.isFinite(rect.top) && rect.top > 0) {
+                                bottom = Math.max(8, Math.round(window.innerHeight - rect.top + 8));
+                            }
+                        }
+                        panel.style.setProperty('--codex-ext-settings-bottom', bottom + 'px');
+                    }
 
                     function buildSettings() {
                         if (document.getElementById(SETT_ID)) return;
@@ -4473,34 +5443,110 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         const bar = document.createElement('div');
                         bar.className = 'xs-bar';
                         const ttl = document.createElement('h5');
-                        ttl.textContent = '⚙ Chat Extensions';
+                        ttl.textContent = 'Chat Extensions';
                         const closeBtn = document.createElement('button');
-                        closeBtn.className = 'xs-close'; closeBtn.textContent = '✕';
+                        closeBtn.className = 'xs-close'; closeBtn.textContent = 'x';
                         closeBtn.addEventListener('click', () => { panel.classList.remove('active'); document.getElementById('codex-ext-settings-btn')?.classList.remove('codex-split-chat-active'); });
                         bar.appendChild(ttl); bar.appendChild(closeBtn);
 
                         const body = document.createElement('div');
                         body.className = 'xs-body';
+                        const tabbed = createTabbedPages(['Alerts', 'Embeds', 'Chat', 'Uploads', 'Tools']);
+                        body.appendChild(tabbed.tabs);
+                        body.appendChild(tabbed.pages);
 
-                        // ── Watched Users ──
-                        body.appendChild(mkSection('👥 Watched Users'));
-                        const wRow = document.createElement('div'); wRow.className = 'xs-row';
-                        const wta = document.createElement('textarea');
-                        wta.className = 'xs-ta'; wta.placeholder = 'destiny\n(one per line)';
-                        wta.value = getWatched().join('\n');
-                        wta.addEventListener('input', () => setWatched(wta.value.split('\n').map(s => s.trim()).filter(Boolean)));
-                        wRow.appendChild(wta); body.appendChild(wRow);
-                        body.appendChild(mkCheckRow('Show inline join/quit/embed alerts for watched users', 'activity.enabled', true));
-                        body.appendChild(mkCheckRow('Alert on JOIN (watched users)', 'activity.join', true));
-                        body.appendChild(mkCheckRow('Alert on QUIT (watched users)', 'activity.quit', true));
-                        body.appendChild(mkCheckRow('Alert on embed update (watched users)', 'activity.embed', true));
-                        body.appendChild(mkCheckRow('Desktop notification when watched user messages', 'notifications.enabled', false, on => {
+                        const alertsPage = tabbed.map.get('Alerts').page;
+                        const embedsPage = tabbed.map.get('Embeds').page;
+                        const chatPage = tabbed.map.get('Chat').page;
+                        const uploadsPage = tabbed.map.get('Uploads').page;
+                        const toolsPage = tabbed.map.get('Tools').page;
+
+                        const activityGroup = mkGroup('Activity Tracking');
+                        const activityModeOptions = [
+                            { value: 'default', label: 'Default list' },
+                            { value: 'custom',  label: 'Custom list' },
+                            { value: 'all',     label: 'Everyone' },
+                            { value: 'none',    label: 'Off' }
+                        ];
+                        activityGroup.appendChild(mkSelectRow('Join alerts',  'alerts.joinMode',  'default', activityModeOptions));
+                        activityGroup.appendChild(mkSelectRow('Quit alerts',  'alerts.quitMode',  'default', activityModeOptions));
+                        activityGroup.appendChild(mkSelectRow('Embed alerts', 'alerts.embedMode', 'default', activityModeOptions));
+                        activityGroup.appendChild(mkUserListRow('Custom activity users', 'alerts.customUsers', [], 'Comma- or newline-separated usernames'));
+                        activityGroup.appendChild(mkUserListRow('Notify users',          'alerts.notifyUsers', ['destiny'], 'Comma- or newline-separated usernames'));
+                        activityGroup.appendChild(mkCheckRow('Enable desktop notifications', 'alerts.desktopNotifications', true, on => {
                             if (on && typeof Notification !== 'undefined' && Notification.permission === 'default') Notification.requestPermission();
                         }));
+                        const permNote = document.createElement('div');
+                        permNote.className = 'xs-note';
+                        permNote.textContent = 'Current permission: ' + (('Notification' in window) ? Notification.permission : 'unsupported');
+                        activityGroup.appendChild(permNote);
+                        const actionsRow = document.createElement('div'); actionsRow.className = 'xs-row-actions';
+                        const reqPermBtn = document.createElement('button');
+                        reqPermBtn.type = 'button';
+                        reqPermBtn.className = 'xs-btn';
+                        reqPermBtn.textContent = 'Request Notification Permission';
+                        reqPermBtn.addEventListener('click', () => {
+                            if (typeof Notification === 'undefined') { alert('This browser does not support desktop notifications.'); return; }
+                            Notification.requestPermission().then(p => { permNote.textContent = 'Current permission: ' + p; });
+                        });
+                        const histBtn = document.createElement('button');
+                        histBtn.type = 'button';
+                        histBtn.className = 'xs-btn';
+                        histBtn.textContent = 'Open Activity History';
+                        histBtn.addEventListener('click', showActivityHistoryDialog);
+                        actionsRow.appendChild(reqPermBtn);
+                        actionsRow.appendChild(histBtn);
+                        activityGroup.appendChild(actionsRow);
+                        alertsPage.appendChild(activityGroup);
 
-                        // ── Activity Alerts ──
-                        body.appendChild(mkSection('🔔 Activity Alerts'));
-                        body.appendChild(mkCheckRow('Play ding when your username is mentioned', 'mentions.ding.enabled', true));
+                        // ── Embeds tab (DGG Mega Suite-style embeDGG) ──
+                        const embedsGroup = mkGroup('embeDGG');
+                        const embedToggleRows = [
+                            ['Enable tweet cards (preview only — full render needs host bridge)', 'embeds.enableTweets',    true],
+                            ['Enable direct media embeds (images / video files)',                  'embeds.enableMedia',     true],
+                            ['Enable YouTube cards',                                              'embeds.enableYouTube',   true],
+                            ['Enable Twitch cards',                                               'embeds.enableTwitch',    true],
+                            ['Enable Kick cards',                                                 'embeds.enableKick',      true],
+                            ['Enable Instagram cards (preview only — needs host bridge)',         'embeds.enableInstagram', true],
+                            ['Blur embedded media until hovered',                                 'embeds.blurMedia',       false]
+                        ];
+                        for (const row of embedToggleRows) {
+                            embedsGroup.appendChild(mkCheckRow(row[0], row[1], row[2], () => applyEmbedRootCss()));
+                        }
+                        const widthRow = document.createElement('div'); widthRow.className = 'xs-row-stacked';
+                        const widthLabel = document.createElement('label'); widthLabel.textContent = 'Media width (px)';
+                        const widthControls = document.createElement('div');
+                        widthControls.style.cssText = 'display:flex;align-items:center;gap:8px;';
+                        const widthRange = document.createElement('input');
+                        widthRange.type = 'range';
+                        widthRange.min = '220';
+                        widthRange.max = '800';
+                        widthRange.step = '10';
+                        widthRange.className = 'xs-range';
+                        widthRange.value = String(xGet('embeds.mediaWidth', 500));
+                        widthRange.style.flex = '1';
+                        const widthValue = document.createElement('span');
+                        widthValue.textContent = widthRange.value + 'px';
+                        widthValue.style.cssText = 'color:#cfd3dc;font-size:11px;min-width:48px;text-align:right;';
+                        widthRange.addEventListener('input', () => {
+                            const v = Number(widthRange.value) || 500;
+                            xSet('embeds.mediaWidth', v);
+                            widthValue.textContent = v + 'px';
+                            applyEmbedRootCss();
+                        });
+                        widthControls.appendChild(widthRange);
+                        widthControls.appendChild(widthValue);
+                        widthRow.appendChild(widthLabel);
+                        widthRow.appendChild(widthControls);
+                        embedsGroup.appendChild(widthRow);
+                        const embedNote = document.createElement('div');
+                        embedNote.className = 'xs-note';
+                        embedNote.textContent = 'Cards render inline below chat messages with a matching link. YouTube uses the public oEmbed endpoint; Twitch/Kick use their iframe players.';
+                        embedsGroup.appendChild(embedNote);
+                        embedsPage.appendChild(embedsGroup);
+
+                        const mentionGroup = mkGroup('Mentions');
+                        mentionGroup.appendChild(mkCheckRow('Play ding when your username is mentioned', 'mentions.ding.enabled', true));
                         const mentionRow = document.createElement('div'); mentionRow.className = 'xs-row';
                         const mentionLabel = document.createElement('label');
                         mentionLabel.textContent = 'Mention username override:';
@@ -4513,39 +5559,23 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         mentionInput.addEventListener('input', () => xSet('mentions.username', mentionInput.value.trim()));
                         mentionRow.appendChild(mentionLabel);
                         mentionRow.appendChild(mentionInput);
-                        body.appendChild(mentionRow);
+                        mentionGroup.appendChild(mentionRow);
+                        alertsPage.appendChild(mentionGroup);
 
-                        // ── DinkDonk ──
-                        body.appendChild(mkSection('🎬 DinkDonk'));
-                        body.appendChild(mkCheckRow('Show DinkDonk poll button', 'dinkdonk.enabled', true, on => {
+                        const dinkGroup = mkGroup('DinkDonk');
+                        dinkGroup.appendChild(mkCheckRow('Show DinkDonk poll button', 'dinkdonk.enabled', true, on => {
                             const b = document.getElementById('codex-dinkdonk-btn');
                             if (b) b.style.display = on ? '' : 'none';
                         }));
-                        body.appendChild(mkCheckRow('Auto-open poll links from DinkDonk_bot', 'dinkdonk.autoOpenPoll', true));
+                        dinkGroup.appendChild(mkCheckRow('Auto-open poll links from DinkDonk_bot', 'dinkdonk.autoOpenPoll', true));
+                        toolsPage.appendChild(dinkGroup);
 
-                        body.appendChild(mkSection('External Chat'));
-                        const extChatRow = document.createElement('div');
-                        extChatRow.className = 'xs-row';
-                        const extChatLabel = document.createElement('label');
-                        extChatLabel.textContent = 'Panel URL:';
-                        extChatLabel.style.flex = '0 0 auto';
-                        extChatLabel.style.color = '#888';
-                        const extChatInput = document.createElement('input');
-                        extChatInput.type = 'text';
-                        extChatInput.placeholder = '#kick/username, #youtube/video-id, or https://...';
-                        extChatInput.value = xGet('externalChat.url', '');
-                        extChatInput.addEventListener('input', () => xSet('externalChat.url', extChatInput.value.trim()));
-                        extChatRow.appendChild(extChatLabel);
-                        extChatRow.appendChild(extChatInput);
-                        body.appendChild(extChatRow);
+                        const chatInputGroup = mkGroup('Chat Input');
+                        chatInputGroup.appendChild(mkCheckRow('Double-click username to append to chat', 'chatInput.doubleClick', false));
+                        chatPage.appendChild(chatInputGroup);
 
-                        // ── Chat Input ──
-                        body.appendChild(mkSection('✏️ Chat Input'));
-                        body.appendChild(mkCheckRow('Double-click username to append to chat', 'chatInput.doubleClick', false));
-
-                        // ── Phrase Highlights ──
-                        body.appendChild(mkSection('🎨 Phrase Highlights'));
-                        body.appendChild(mkCheckRow('Highlight chat input on flagged phrases', 'phrases.enabled', true));
+                        const phraseGroup = mkGroup('Phrase Highlights');
+                        phraseGroup.appendChild(mkCheckRow('Highlight chat input on flagged phrases', 'phrases.enabled', true));
                         const phraseList = document.createElement('div');
                         phraseList.className = 'xs-phrase-list';
                         function renderPhraseList() {
@@ -4557,38 +5587,45 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                                 tin.addEventListener('input', () => { const cur = xGet('phrases', []); if (cur[i]) { cur[i].text = tin.value; xSet('phrases', cur); } });
                                 const cin = document.createElement('input'); cin.type = 'color'; cin.value = p.color || '#1f0000';
                                 cin.addEventListener('input', () => { const cur = xGet('phrases', []); if (cur[i]) { cur[i].color = cin.value; xSet('phrases', cur); } });
-                                const del = document.createElement('button'); del.className = 'xs-del'; del.textContent = '✕';
+                                const del = document.createElement('button'); del.className = 'xs-del'; del.textContent = 'âœ•';
                                 del.addEventListener('click', () => { const cur = xGet('phrases', []); cur.splice(i, 1); xSet('phrases', cur); renderPhraseList(); });
                                 row.appendChild(tin); row.appendChild(cin); row.appendChild(del);
                                 phraseList.appendChild(row);
                             });
                         }
                         renderPhraseList();
-                        body.appendChild(phraseList);
+                        phraseGroup.appendChild(phraseList);
                         const addPhrase = document.createElement('button');
                         addPhrase.className = 'xs-add'; addPhrase.textContent = '+ Add phrase';
                         addPhrase.addEventListener('click', () => { const cur = xGet('phrases', []); cur.push({ text: '', color: '#1f0000' }); xSet('phrases', cur); renderPhraseList(); });
-                        body.appendChild(addPhrase);
+                        phraseGroup.appendChild(addPhrase);
+                        chatPage.appendChild(phraseGroup);
 
-                        // ── Hidden Phrases ──
-                        body.appendChild(mkSection('🚫 Hidden Phrases'));
-                        body.appendChild(mkCheckRow('Hide messages containing these phrases', 'hiddenPhrases.enabled', false));
+                        const hiddenGroup = mkGroup('Hidden Phrases');
+                        hiddenGroup.appendChild(mkCheckRow('Hide messages containing these phrases', 'hiddenPhrases.enabled', false));
                         const hidTa = document.createElement('textarea');
                         hidTa.className = 'xs-ta'; hidTa.placeholder = 'one phrase per line';
                         hidTa.value = (xGet('hiddenPhrases', []) || []).join('\n');
                         hidTa.addEventListener('input', () => xSet('hiddenPhrases', hidTa.value.split('\n').map(s => s.trim()).filter(Boolean)));
-                        body.appendChild(hidTa);
+                        hiddenGroup.appendChild(hidTa);
+                        chatPage.appendChild(hiddenGroup);
 
-                        // ── Image Upload ──
-                        body.appendChild(mkSection('📎 Image Upload'));
-                        body.appendChild(mkCheckRow('Auto-upload pasted images to femboy.beauty', 'imageUpload.enabled', false));
+                        const uploadGroup = mkGroup('Image Upload');
+                        uploadGroup.appendChild(mkCheckRow('Auto-upload pasted images to femboy.beauty', 'imageUpload.enabled', false));
+                        uploadsPage.appendChild(uploadGroup);
 
                         panel.appendChild(bar);
                         panel.appendChild(body);
                         chat.appendChild(panel);
+                        updateSettingsPanelPosition();
+                        if (!window.__codexExtSettingsPositionBound) {
+                            window.__codexExtSettingsPositionBound = true;
+                            window.addEventListener('resize', updateSettingsPanelPosition, { passive: true });
+                            window.addEventListener('scroll', updateSettingsPanelPosition, { passive: true });
+                        }
                     }
 
-                    // ── Snip button (scissors → ms-screenclip → femboy.beauty) ──────
+                    // â”€â”€ Snip button (scissors â†’ ms-screenclip â†’ femboy.beauty) â”€â”€â”€â”€â”€â”€
                     function tryPostSnipStart(payload) {
                         let sent = false;
                         const host = window.chrome && window.chrome.webview;
@@ -4674,7 +5711,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         btn.setAttribute('role', 'button');
                         btn.title = 'Snip & upload';
                         btn.setAttribute('data-tippy-content', 'Snip & upload to femboy.beauty');
-                        btn.innerHTML = `<i class=""btn-icon"" style=""opacity:1;font-style:normal;font-size:16px;line-height:1;display:flex;align-items:center;justify-content:center;"">✂</i>`;
+                        btn.innerHTML = `<i class=""btn-icon"" aria-hidden=""true""><svg xmlns=""http://www.w3.org/2000/svg"" viewBox=""0 0 24 24""><circle cx=""6"" cy=""6"" r=""3""></circle><circle cx=""6"" cy=""18"" r=""3""></circle><path d=""M20 4 8.12 15.88""></path><path d=""M14.47 14.48 20 20""></path><path d=""M8.12 8.12 12 12""></path></svg></i>`;
                         btn.addEventListener('click', e => {
                             e.preventDefault(); e.stopPropagation();
                             // Debug: immediately turn orange so we know click fired
@@ -4684,7 +5721,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                                 btn.style.outline = '2px solid red';
                                 btn.title = 'ERR: no webview host';
                             }
-                            btn.title = 'Snipping…';
+                            btn.title = 'Snippingâ€¦';
                             btn.classList.add('codex-split-chat-active');
                             postSnipDebug('click-before-send', {});
                             const payload = { type: 'codex-snip-start', requestId: String(Date.now()) };
@@ -4741,7 +5778,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         });
                     }
 
-                    // ── Receive snip URL back from C# ────────────────────────────
+                    // â”€â”€ Receive snip URL back from C# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                     if (!window.__codexSnipListenerAdded) {
                         window.__codexSnipListenerAdded = true;
                         window.__codexLastSnipDoneSignature = window.__codexLastSnipDoneSignature || '';
@@ -4826,12 +5863,13 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         btn.setAttribute('role', 'button');
                         btn.title = 'Chat Extensions';
                         btn.setAttribute('data-tippy-content', 'Chat Extensions');
-                        btn.innerHTML = `<i class=""btn-icon"" style=""opacity:1;font-style:normal;font-size:15px;display:flex;align-items:center;justify-content:center;"">⚙</i>`;
+                        btn.innerHTML = `<i class=""btn-icon"" aria-hidden=""true""><svg xmlns=""http://www.w3.org/2000/svg"" viewBox=""0 0 24 24""><circle cx=""12"" cy=""12"" r=""3""></circle><path d=""M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 8.92 4.6 1.65 1.65 0 0 0 10 3.09V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09A1.65 1.65 0 0 0 19.4 15z""></path></svg></i>`;
                         btn.addEventListener('click', e => {
                             e.preventDefault(); e.stopPropagation();
                             buildSettings();
                             const p = document.getElementById(SETT_ID);
                             const open = p && !p.classList.contains('active');
+                            if (open) updateSettingsPanelPosition();
                             if (p) p.classList.toggle('active', !!open);
                             btn.classList.toggle('codex-split-chat-active', !!open);
                             // close other menus
@@ -4840,13 +5878,12 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         ref.parentElement.insertBefore(btn, ref);
                     }
 
-                    // ── Bootstrap ─────────────────────────────────────────────────
+                    // â”€â”€ Bootstrap â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                     function boot() {
                         if (!document.querySelector('#chat-tools-wrap, .chat-tools-group')) return false;
                         ensureSettingsStyles();
                         ensureDualChatMessageBridge();
                         buildSettingsBtn();
-                        removeExtPanelBtn();
                         buildDinkDonkBtn();
                         buildSnipBtn();
                         buildDualChatBtn();
@@ -4944,18 +5981,12 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 }
 
                 NotifyDualChatSourceChanged();
-                ApplyBigscreenExternalChatLayout(_dualChatHostEnabled && IsBigscreenPage());
+                ApplyBigscreenDualChatLayout(_dualChatHostEnabled && IsBigscreenPage());
 
                 if (_runSplitSelfTest && !_splitSelfTestStarted)
                 {
                     _splitSelfTestStarted = true;
                     _pendingSplitSelfTestTask = RunSplitSelfTestAsync();
-                }
-
-                if (_runPopoutPauseSelfTest && !_popoutPauseSelfTestStarted)
-                {
-                    _popoutPauseSelfTestStarted = true;
-                    _pendingSplitSelfTestTask = RunPopoutPauseSelfTestAsync();
                 }
 
                 if (_runToolbarSelfTest && !_toolbarSelfTestStarted)
@@ -4993,7 +6024,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 UpdateAddressBox(_webView.Source.AbsoluteUri);
             }
 
-            ApplyBigscreenExternalChatLayout(_dualChatHostEnabled && IsBigscreenPage());
+            ApplyBigscreenDualChatLayout(_dualChatHostEnabled && IsBigscreenPage());
             UpdateBigscreenBarVisibility();
             LayoutDualChatPanel();
         }
@@ -5251,8 +6282,6 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         let dinkDonkTogglesWorked = false;
                         let dinkDonkButtonToggleWorked = false;
                         let dinkDonkAutoOpenFunctionWorked = false;
-                        let externalChatUrlPersistWorked = false;
-                        let externalChatPanelButtonAbsent = false;
                         let chatInputDoubleClickToggleWorked = false;
                         let chatInputDoubleClickFunctionWorked = false;
                         let phraseHighlightsToggleWorked = false;
@@ -5551,25 +6580,6 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             dinkDonkTogglesWorked = dinkDonkTogglesWorked &&
                                 await verifyToggle('xs-cb-dinkdonk-autoOpenPoll', 'dinkdonk.autoOpenPoll');
 
-                            const allInputs = extPanel ? Array.from(extPanel.querySelectorAll('input[type=""text""]')) : [];
-                            const externalUrlInput = allInputs.find((input) => {
-                                return input instanceof HTMLInputElement &&
-                                    String(input.placeholder || '').toLowerCase().indexOf('#kick/username') >= 0;
-                            });
-                            if (externalUrlInput instanceof HTMLInputElement) {
-                                const before = externalUrlInput.value;
-                                externalUrlInput.value = '#kick/codexselftest';
-                                externalUrlInput.dispatchEvent(new Event('input', { bubbles: true }));
-                                await wait(80);
-                                const stored = readStored('externalChat.url');
-                                const writeWorked = stored === '#kick/codexselftest';
-                                externalUrlInput.value = before;
-                                externalUrlInput.dispatchEvent(new Event('input', { bubbles: true }));
-                                await wait(80);
-                                const restored = readStored('externalChat.url') === before;
-                                externalChatUrlPersistWorked = writeWorked && restored;
-                            }
-
                             chatInputDoubleClickToggleWorked = await verifyToggle('xs-cb-chatInput-doubleClick', 'chatInput.doubleClick');
                             phraseHighlightsToggleWorked = await verifyToggle('xs-cb-phrases-enabled', 'phrases.enabled');
                             phraseAddButtonFound = !!(extPanel && Array.from(extPanel.querySelectorAll('button')).some((buttonEl) => {
@@ -5616,19 +6626,24 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                                 writeStored('activity.join', true);
                                 writeStored('activity.quit', true);
                                 writeStored('activity.embed', true);
-                                const baseInfoCount = chatLines.querySelectorAll('.msg-info').length;
+                                const baseActivityCount = chatLines.querySelectorAll('.codex-activity-alert').length;
                                 window.__codexEmitWsTest('JOIN ' + JSON.stringify({ nick: 'codexwatch' }));
                                 window.__codexEmitWsTest('QUIT ' + JSON.stringify({ nick: 'codexwatch' }));
                                 window.__codexEmitWsTest('UPDATEUSER ' + JSON.stringify({
                                     nick: 'codexwatch',
-                                    watching: { title: 'codex stream', platform: 'kick', channel: 'codexwatch' }
+                                    watching: { id: 'codex-stream', title: 'codex stream', platform: 'kick', channel: 'codexwatch' }
                                 }));
                                 await wait(160);
-                                const infoMessages = Array.from(chatLines.querySelectorAll('.msg-info')).slice(baseInfoCount);
-                                const infoText = infoMessages.map((n) => (n.textContent || '').toLowerCase()).join(' ');
-                                activityFunctionWorked = infoText.indexOf('codexwatch joined') >= 0 &&
-                                    infoText.indexOf('codexwatch left') >= 0 &&
-                                    infoText.indexOf('watching') >= 0;
+                                const activityMessages = Array.from(chatLines.querySelectorAll('.codex-activity-alert')).slice(baseActivityCount);
+                                const activityText = activityMessages.map((n) => (n.textContent || '').toLowerCase()).join(' ');
+                                const syntheticMarked = activityMessages.every((n) =>
+                                    n.getAttribute('data-codex-activity-synthetic') === '1' &&
+                                    n.getAttribute('data-dgg-mega-synthetic') === '1');
+                                activityFunctionWorked = syntheticMarked &&
+                                    activityText.indexOf('codexwatch') >= 0 &&
+                                    activityText.indexOf('join') >= 0 &&
+                                    activityText.indexOf('quit') >= 0 &&
+                                    activityText.indexOf('#kick/codex-stream') >= 0;
                                 writeStored('watchedUsers', watchedBefore);
                                 writeStored('activity.enabled', activityEnabledBefore);
                                 writeStored('activity.join', activityJoinBefore);
@@ -5691,8 +6706,6 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                                     writeStored('dinkdonk.autoOpenPoll', autoOpenBefore);
                                 }
                             }
-
-                            externalChatPanelButtonAbsent = !document.getElementById('codex-ext-panel-btn');
 
                             {
                                 const ta = document.querySelector('#chat-input-control');
@@ -5936,12 +6949,6 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         if (!dinkDonkAutoOpenFunctionWorked) {
                             failedChecks.push('dinkdonk-autoopen-function');
                         }
-                        if (!externalChatUrlPersistWorked) {
-                            failedChecks.push('external-chat-url-persist');
-                        }
-                        if (!externalChatPanelButtonAbsent) {
-                            failedChecks.push('external-chat-panel-button-absent');
-                        }
                         if (!chatInputDoubleClickToggleWorked) {
                             failedChecks.push('chat-input-doubleclick-toggle');
                         }
@@ -6023,8 +7030,6 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             dinkDonkTogglesWorked: dinkDonkTogglesWorked,
                             dinkDonkButtonToggleWorked: dinkDonkButtonToggleWorked,
                             dinkDonkAutoOpenFunctionWorked: dinkDonkAutoOpenFunctionWorked,
-                            externalChatUrlPersistWorked: externalChatUrlPersistWorked,
-                            externalChatPanelButtonAbsent: externalChatPanelButtonAbsent,
                             chatInputDoubleClickToggleWorked: chatInputDoubleClickToggleWorked,
                             chatInputDoubleClickFunctionWorked: chatInputDoubleClickFunctionWorked,
                             phraseHighlightsToggleWorked: phraseHighlightsToggleWorked,
@@ -6065,7 +7070,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             }
             catch (Exception ex)
             {
-                JavaScriptSerializer serializer = new JavaScriptSerializer();
+                JavaScriptSerializer serializer = ScriptJson.Serializer;
                 WriteSplitSelfTestResult(serializer.Serialize(new Dictionary<string, object>
                 {
                     { "ok", false },
@@ -6077,7 +7082,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
         private async System.Threading.Tasks.Task RunDualSelfTestAsync()
         {
-            JavaScriptSerializer serializer = new JavaScriptSerializer();
+            JavaScriptSerializer serializer = ScriptJson.Serializer;
             try
             {
                 AgentDebugLog.Write(
@@ -6385,9 +7390,13 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 bool bigscreenDualButtonFound = bigscreenValues != null && bigscreenValues.ContainsKey("dualButtonFound") && Convert.ToBoolean(bigscreenValues["dualButtonFound"]);
                 bool bigscreenToggledOn = bigscreenValues != null && bigscreenValues.ContainsKey("toggledOn") && Convert.ToBoolean(bigscreenValues["toggledOn"]);
                 bool bigscreenToggledOff = bigscreenValues != null && bigscreenValues.ContainsKey("toggledOff") && Convert.ToBoolean(bigscreenValues["toggledOff"]);
+                bool bigscreenHostPanelWidthOk = false;
+                int bigscreenHostPanelWidth = 0;
+                int bigscreenExpectedHostPanelWidth = 0;
+                int bigscreenReportedPaneWidth = 0;
                 if (!bigscreenDualButtonFound || !(bigscreenToggledOn && bigscreenToggledOff))
                 {
-                    for (int i = 0; i < 24 && !bigscreenDualButtonFound; i++)
+                    for (int i = 0; i < 24 && (!bigscreenDualButtonFound || !bigscreenToggledOn); i++)
                     {
                         string enableRaw = await _webView.ExecuteScriptAsync(@"
                             (() => {
@@ -6423,7 +7432,17 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                                     return JSON.stringify({ found: false, active: false, context: 'none' });
                                 }
 
-                                if (!btn.classList.contains('codex-split-chat-active')) {
+                                if (btn.classList.contains('codex-split-chat-active')) {
+                                    btn.click();
+                                    window.setTimeout(() => {
+                                        try {
+                                            if (!btn.classList.contains('codex-split-chat-active')) {
+                                                btn.click();
+                                            }
+                                        } catch (error) {
+                                        }
+                                    }, 180);
+                                } else {
                                     btn.click();
                                 }
 
@@ -6454,6 +7473,21 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
                     await System.Threading.Tasks.Task.Delay(900);
                     bigscreenToggledOn = _dualChatHostEnabled && _dualChatPanel != null && _dualChatPanel.Visible;
+                    if (bigscreenToggledOn && _dualChatPanel != null)
+                    {
+                        bigscreenHostPanelWidth = _dualChatPanel.Bounds.Width;
+                        bigscreenReportedPaneWidth = _dualChatPaneWidth;
+                        Rectangle webViewBounds = _webView.Bounds;
+                        double scaleX = _bigscreenViewportWidth > 0
+                            ? (double)webViewBounds.Width / _bigscreenViewportWidth
+                            : 1.0;
+                        bigscreenExpectedHostPanelWidth = bigscreenReportedPaneWidth > 0
+                            ? Math.Max(0, (int)Math.Round(bigscreenReportedPaneWidth * scaleX))
+                            : 0;
+                        bigscreenHostPanelWidthOk = bigscreenExpectedHostPanelWidth > 0 &&
+                            Math.Abs(bigscreenHostPanelWidth - bigscreenExpectedHostPanelWidth) <=
+                                Math.Max(10, (int)Math.Round(bigscreenExpectedHostPanelWidth * 0.08));
+                    }
 
                     string disableRaw = await _webView.ExecuteScriptAsync(@"
                         (() => {
@@ -6511,6 +7545,10 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 {
                     failedChecks.Add("bigscreen-dual-toggle");
                 }
+                if (!bigscreenHostPanelWidthOk)
+                {
+                    failedChecks.Add("bigscreen-host-panel-width");
+                }
                 if (!bigscreenGeometryOk)
                 {
                     failedChecks.Add("bigscreen-kick-chat-overlaps-media");
@@ -6529,6 +7567,10 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     { "bigscreenDualButtonFound", bigscreenDualButtonFound },
                     { "bigscreenToggledOn", bigscreenToggledOn },
                     { "bigscreenToggledOff", bigscreenToggledOff },
+                    { "bigscreenHostPanelWidthOk", bigscreenHostPanelWidthOk },
+                    { "bigscreenHostPanelWidth", bigscreenHostPanelWidth },
+                    { "bigscreenExpectedHostPanelWidth", bigscreenExpectedHostPanelWidth },
+                    { "bigscreenReportedPaneWidth", bigscreenReportedPaneWidth },
                     { "bigscreenGeometryOk", bigscreenGeometryOk },
                     { "bigscreenGeometrySample", geometryLastSample != null ? serializer.Serialize(geometryLastSample) : string.Empty }
                 }));
@@ -6570,7 +7612,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
         private async System.Threading.Tasks.Task RunBigscreenGeometrySelfTestAsync()
         {
-            JavaScriptSerializer serializer = new JavaScriptSerializer();
+            JavaScriptSerializer serializer = ScriptJson.Serializer;
             const string geomScript = @"
                     (() => {
                         function playerMediaBottom() {
@@ -6628,11 +7670,13 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         }) || null;
                         const kickSrc = kickFrame ? String(kickFrame.getAttribute('src') || kickFrame.src || '') : '';
                         const kickAllow = kickFrame ? String(kickFrame.getAttribute('allow') || '') : '';
-                        const kickNormalized = kickSrc.toLowerCase().indexOf('player.kick.com') >= 0 &&
+                        const playerMediaPresent = mb > 64 && mr > 64;
+                        const kickNormalized = kickFrame ? (
+                            kickSrc.toLowerCase().indexOf('player.kick.com') >= 0 &&
                             kickSrc.toLowerCase().indexOf('autoplay=true') >= 0 &&
-                            kickSrc.toLowerCase().indexOf('muted=true') >= 0 &&
                             kickAllow.toLowerCase().indexOf('autoplay') >= 0 &&
-                            !!(kickFrame && kickFrame.getAttribute('allowfullscreen'));
+                            !!kickFrame.getAttribute('allowfullscreen')
+                        ) : playerMediaPresent;
                         return JSON.stringify({
                             ok: !bad && kickNormalized && sideLayoutOk,
                             mediaBottom: mb,
@@ -6646,8 +7690,34 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             forcedPush: forcedPush,
                             kickSrc: kickSrc,
                             kickAllow: kickAllow,
+                            playerMediaPresent: playerMediaPresent,
                             kickNormalized: kickNormalized
                         });
+                    })();
+                ";
+            const string kickReloadProbeScript = @"
+                    (() => {
+                        const id = 'codex-kick-reload-probe';
+                        let frame = document.getElementById(id);
+                        if (!frame) {
+                            frame = document.createElement('iframe');
+                            frame.id = id;
+                            frame.style.cssText = 'position:absolute;left:-10000px;top:-10000px;width:1px;height:1px;border:0;opacity:0;pointer-events:none;';
+                            frame.setAttribute('aria-hidden', 'true');
+                            frame.setAttribute('src', 'https://player.kick.com/destiny?codexReloadProbe=1');
+                            document.documentElement.appendChild(frame);
+                        }
+
+                        return String(frame.getAttribute('src') || frame.src || '');
+                    })();
+                ";
+            const string kickReloadProbeCleanupScript = @"
+                    (() => {
+                        const frame = document.getElementById('codex-kick-reload-probe');
+                        if (frame && frame.parentNode) {
+                            frame.parentNode.removeChild(frame);
+                        }
+                        return true;
                     })();
                 ";
             const string collapseToggleScript = @"
@@ -6726,6 +7796,19 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
                             return document;
                         }
+                        function frameSrc(frame) {
+                            return String(frame && (frame.getAttribute('src') || frame.src || '') || '').toLowerCase();
+                        }
+                        function findFrame(match) {
+                            const frames = Array.from(document.querySelectorAll('iframe'));
+                            for (let i = 0; i < frames.length; i++) {
+                                const frame = frames[i];
+                                if (match(frameSrc(frame))) {
+                                    return frame;
+                                }
+                            }
+                            return null;
+                        }
 
                         const doc = findChatDoc();
                         const button = doc ? doc.getElementById('codex-stream-chat-btn') : null;
@@ -6754,9 +7837,26 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         const activeClass = !!(doc.body && doc.body.classList.contains('codex-desktop-external-chat-active'));
                         const buttonActive = button.classList.contains('codex-split-chat-active');
                         const frameAlreadyHalf = expectedHalf > 0 && rootWidth > 0 && rootWidth <= widthLimit;
+                        const chatFrame = findFrame((src) => src.indexOf('/embed/chat') >= 0);
+                        const kickChatFrame = findFrame((src) => {
+                            return src.indexOf('kick.com') >= 0 &&
+                                src.indexOf('player.kick.com') < 0 &&
+                                ((src.indexOf('/popout/') >= 0 && src.indexOf('/chat') >= 0) ||
+                                    src.indexOf('widgets.chat') >= 0 ||
+                                    src.indexOf('kick.com/chat') >= 0);
+                        });
+                        const chatTarget = chatFrame && chatFrame.parentElement ? chatFrame.parentElement : chatFrame;
+                        const kickTarget = kickChatFrame && kickChatFrame.parentElement ? kickChatFrame.parentElement : kickChatFrame;
+                        const chatTargetWidth = chatTarget ? Math.round(chatTarget.getBoundingClientRect().width || 0) : 0;
+                        const kickTargetWidth = kickTarget ? Math.round(kickTarget.getBoundingClientRect().width || 0) : 0;
+                        const splitWidthOk = !kickTarget || (
+                            chatTargetWidth > 0 &&
+                            kickTargetWidth > 0 &&
+                            Math.abs(chatTargetWidth - kickTargetWidth) <= Math.max(8, Math.round(chatTargetWidth * 0.08))
+                        );
 
                         return JSON.stringify({
-                            ok: buttonActive && (activeClass || frameAlreadyHalf) && wrapOk && inputOk && toolsOk,
+                            ok: buttonActive && (activeClass || frameAlreadyHalf) && wrapOk && inputOk && toolsOk && splitWidthOk,
                             activeClass: activeClass,
                             buttonActive: buttonActive,
                             frameAlreadyHalf: frameAlreadyHalf,
@@ -6769,7 +7869,10 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             toolsWidth: toolsWidth,
                             wrapOk: wrapOk,
                             inputOk: inputOk,
-                            toolsOk: toolsOk
+                            toolsOk: toolsOk,
+                            chatTargetWidth: chatTargetWidth,
+                            kickTargetWidth: kickTargetWidth,
+                            splitWidthOk: splitWidthOk
                         });
                     })();
                 ";
@@ -6826,6 +7929,15 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     await System.Threading.Tasks.Task.Delay(700);
                 }
 
+                string kickProbeBefore = await _webView.ExecuteScriptAsync(kickReloadProbeScript);
+                await System.Threading.Tasks.Task.Delay(2600);
+                string kickProbeAfter = await _webView.ExecuteScriptAsync(kickReloadProbeScript);
+                await _webView.ExecuteScriptAsync(kickReloadProbeCleanupScript);
+                bool kickPlayerSrcStable = string.Equals(
+                    NormalizeWebViewScriptString(kickProbeBefore, serializer),
+                    NormalizeWebViewScriptString(kickProbeAfter, serializer),
+                    StringComparison.Ordinal);
+
                 Dictionary<string, object> collapseToggleSample = null;
                 for (int i = 0; i < 40; i++)
                 {
@@ -6873,9 +7985,12 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 WriteSplitSelfTestResult(serializer.Serialize(new Dictionary<string, object>
                 {
                     { "test", "bigscreen-geometry" },
-                    { "ok", geometryOk && collapseOk },
+                    { "ok", geometryOk && collapseOk && kickPlayerSrcStable },
                     { "geometryOk", geometryOk },
                     { "collapseOk", collapseOk },
+                    { "kickPlayerSrcStable", kickPlayerSrcStable },
+                    { "kickProbeBefore", NormalizeWebViewScriptString(kickProbeBefore, serializer) },
+                    { "kickProbeAfter", NormalizeWebViewScriptString(kickProbeAfter, serializer) },
                     { "lastSampleJson", lastSample != null ? serializer.Serialize(lastSample) : string.Empty },
                     { "collapseToggleSampleJson", collapseToggleSample != null ? serializer.Serialize(collapseToggleSample) : string.Empty },
                     { "collapseSampleJson", collapseSample != null ? serializer.Serialize(collapseSample) : string.Empty }
@@ -6889,6 +8004,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     {
                         { "ok", geometryOk },
                         { "collapseOk", collapseOk },
+                        { "kickPlayerSrcStable", kickPlayerSrcStable },
                         { "lastSampleJson", lastSample != null ? serializer.Serialize(lastSample) : string.Empty },
                         { "collapseToggleSampleJson", collapseToggleSample != null ? serializer.Serialize(collapseToggleSample) : string.Empty },
                         { "collapseSampleJson", collapseSample != null ? serializer.Serialize(collapseSample) : string.Empty }
@@ -6917,7 +8033,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
         private async System.Threading.Tasks.Task RunStreamChatPanelSelfTestAsync()
         {
-            JavaScriptSerializer serializer = new JavaScriptSerializer();
+            JavaScriptSerializer serializer = ScriptJson.Serializer;
             const int maxOpMs = 10000;
             try
             {
@@ -7137,55 +8253,6 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             }
         }
 
-        private async System.Threading.Tasks.Task RunPopoutPauseSelfTestAsync()
-        {
-            MediaPopoutForm popoutForm = null;
-            try
-            {
-                await System.Threading.Tasks.Task.Delay(750);
-                MediaPopoutTarget target = new MediaPopoutTarget
-                {
-                    PlayerUrl = string.Empty,
-                    UseHostedVideoElement = true
-                };
-
-                popoutForm = new MediaPopoutForm(_storageRoot, target);
-                popoutForm.Show(this);
-
-                Dictionary<string, object> result = await popoutForm.RunPauseResumeButtonSelfTestAsync();
-                AgentDebugLog.Write(
-                    "post-fix",
-                    "P2",
-                    "DestinyChatDesktop.cs:4518",
-                    "Popout pause self-test result",
-                    result ?? new Dictionary<string, object>());
-            }
-            catch (Exception ex)
-            {
-                AgentDebugLog.Write(
-                    "post-fix",
-                    "P2",
-                    "DestinyChatDesktop.cs:4528",
-                    "Popout pause self-test failed",
-                    new Dictionary<string, object>
-                    {
-                        { "error", ex.Message }
-                    });
-            }
-            finally
-            {
-                if (popoutForm != null && !popoutForm.IsDisposed)
-                {
-                    popoutForm.Close();
-                }
-
-                if (_runPopoutPauseSelfTest && !IsDisposed)
-                {
-                    BeginInvoke(new Action(Close));
-                }
-            }
-        }
-
         private async System.Threading.Tasks.Task RunToolbarSelfTestAsync()
         {
             List<string> failedSteps = new List<string>();
@@ -7379,11 +8446,10 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                                 string parsed = raw;
                                 if (parsed.Length >= 2 && parsed[0] == '"' && parsed[parsed.Length - 1] == '"')
                                 {
-                                    JavaScriptSerializer serializer = new JavaScriptSerializer();
-                                    parsed = serializer.Deserialize<string>(parsed);
+                                    parsed = ScriptJson.Serializer.Deserialize<string>(parsed);
                                 }
 
-                                Dictionary<string, object> probe = new JavaScriptSerializer().DeserializeObject(parsed) as Dictionary<string, object>;
+                                Dictionary<string, object> probe = ScriptJson.Serializer.DeserializeObject(parsed) as Dictionary<string, object>;
                                 if (probe != null)
                                 {
                                     int textLen = probe.ContainsKey("textLen") ? Convert.ToInt32(probe["textLen"]) : 0;
@@ -7673,6 +8739,20 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             }
         }
 
+        private static string NormalizeWebViewScriptString(string rawResult, JavaScriptSerializer serializer)
+        {
+            string normalized = rawResult ?? string.Empty;
+            if (!string.IsNullOrWhiteSpace(normalized) &&
+                normalized.Length >= 2 &&
+                normalized[0] == '"' &&
+                normalized[normalized.Length - 1] == '"')
+            {
+                normalized = serializer.Deserialize<string>(normalized);
+            }
+
+            return normalized ?? string.Empty;
+        }
+
         private void WriteSplitSelfTestResult(string rawResult)
         {
             try
@@ -7682,15 +8762,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     return;
                 }
 
-                string normalized = rawResult;
-                if (!string.IsNullOrWhiteSpace(normalized) &&
-                    normalized.Length >= 2 &&
-                    normalized[0] == '"' &&
-                    normalized[normalized.Length - 1] == '"')
-                {
-                    JavaScriptSerializer serializer = new JavaScriptSerializer();
-                    normalized = serializer.Deserialize<string>(normalized);
-                }
+                string normalized = NormalizeWebViewScriptString(rawResult, ScriptJson.Serializer);
 
                 File.WriteAllText(_selfTestResultPath, normalized ?? string.Empty);
             }
@@ -7699,7 +8771,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             }
             finally
             {
-                if (_runSplitSelfTest || _runPopoutPauseSelfTest || _runDualSelfTest || _runBigscreenGeometrySelfTest || _runStreamChatPanelSelfTest)
+                if (_runSplitSelfTest || _runDualSelfTest || _runBigscreenGeometrySelfTest || _runStreamChatPanelSelfTest)
                 {
                     BeginInvoke(new Action(Close));
                 }
@@ -7809,7 +8881,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
         {
             try
             {
-                JavaScriptSerializer serializer = new JavaScriptSerializer();
+                JavaScriptSerializer serializer = ScriptJson.Serializer;
                 object payload = serializer.DeserializeObject(e.WebMessageAsJson);
                 Dictionary<string, object> message = payload as Dictionary<string, object>;
                 if (message == null || !message.ContainsKey("type"))
@@ -7887,7 +8959,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     // #endregion
                     try
                     {
-                        JavaScriptSerializer ackSerializer = new JavaScriptSerializer();
+                        JavaScriptSerializer ackSerializer = ScriptJson.Serializer;
                         _webView.CoreWebView2.PostWebMessageAsString(ackSerializer.Serialize(new Dictionary<string, object>
                         {
                             { "type", "codex-snip-ack" },
@@ -8121,6 +9193,11 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     int inputTop = 0;
                     int viewportWidth = 0;
                     int viewportHeight = 0;
+                    int paneLeft = CoerceWebMessageInt(message, "paneLeft");
+                    int paneTop = CoerceWebMessageInt(message, "paneTop");
+                    int paneWidth = CoerceWebMessageInt(message, "paneWidth");
+                    int paneHeight = CoerceWebMessageInt(message, "paneHeight");
+                    bool layoutActive = CoerceWebMessageBool(message, "layoutActive");
                     if (message.ContainsKey("chatTop"))
                     {
                         object chatTopValue = message["chatTop"];
@@ -8186,6 +9263,22 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     {
                         _dualChatInputTop = Math.Max(0, inputTop);
                     }
+                    if (layoutActive && paneWidth > 0 && paneHeight > 0)
+                    {
+                        _dualChatPaneLeft = Math.Max(0, paneLeft);
+                        _dualChatPaneTop = Math.Max(0, paneTop);
+                        _dualChatPaneWidth = Math.Max(0, paneWidth);
+                        _dualChatPaneHeight = Math.Max(0, paneHeight);
+                        _dualChatLayoutActive = true;
+                    }
+                    else if (!layoutActive)
+                    {
+                        _dualChatPaneLeft = 0;
+                        _dualChatPaneTop = 0;
+                        _dualChatPaneWidth = 0;
+                        _dualChatPaneHeight = 0;
+                        _dualChatLayoutActive = false;
+                    }
 
                     if (_runToolbarSelfTest || _runSplitSelfTest || _runBigscreenGeometrySelfTest || _runDualSelfTest)
                     {
@@ -8199,6 +9292,11 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             {
                                 { "chatTop", _bigscreenChatTopOffset },
                                 { "inputTop", _dualChatInputTop },
+                                { "paneLeft", _dualChatPaneLeft },
+                                { "paneTop", _dualChatPaneTop },
+                                { "paneWidth", _dualChatPaneWidth },
+                                { "paneHeight", _dualChatPaneHeight },
+                                { "layoutActive", _dualChatLayoutActive },
                                 { "windowWidth", _bigscreenViewportWidth },
                                 { "windowHeight", _bigscreenViewportHeight },
                                 { "currentPage", _webView.Source != null ? _webView.Source.AbsoluteUri : string.Empty }
@@ -8261,6 +9359,11 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
                 if (string.Equals(type, "codex-dual-chat-layout", StringComparison.OrdinalIgnoreCase))
                 {
+                    if (IsBigscreenPage())
+                    {
+                        return;
+                    }
+
                     int inputTop = CoerceWebMessageInt(message, "inputTop");
                     int paneLeft = CoerceWebMessageInt(message, "paneLeft");
                     int paneTop = CoerceWebMessageInt(message, "paneTop");
@@ -8362,7 +9465,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             {
                 if (_runSplitSelfTest)
                 {
-                    JavaScriptSerializer serializer = new JavaScriptSerializer();
+                    JavaScriptSerializer serializer = ScriptJson.Serializer;
                     WriteSplitSelfTestResult(serializer.Serialize(new Dictionary<string, object>
                     {
                         { "type", "split-self-test-result" },
@@ -8413,7 +9516,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 // Clear clipboard so we can detect when a new snip lands
                 this.Invoke((Action)(() => { try { Clipboard.Clear(); } catch { } }));
 
-                // Send Win+Shift+S — system-level hotkey that triggers the snip overlay
+                // Send Win+Shift+S â€” system-level hotkey that triggers the snip overlay
                 // on all Windows 10/11 machines regardless of which snip app is installed.
                 // The snip overlay auto-copies the selection to clipboard on completion.
                 SendSnipHotkey();
@@ -8510,7 +9613,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     using (StreamReader reader = new StreamReader(resp.GetResponseStream()))
                     {
                         string json = await reader.ReadToEndAsync();
-                        JavaScriptSerializer ser = new JavaScriptSerializer();
+                        JavaScriptSerializer ser = ScriptJson.Serializer;
                         Dictionary<string, object> dict = ser.DeserializeObject(json) as Dictionary<string, object>;
                         if (dict != null && dict.ContainsKey("link"))
                             uploadedUrl = Convert.ToString(dict["link"]);
@@ -8808,6 +9911,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
         private void OnMainFormResize(object sender, EventArgs e)
         {
+            UpdateCaptionMaxButtonGlyph();
             LayoutDualChatPanel();
         }
 
@@ -8960,9 +10064,9 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 _bigscreenBarPanel.BringToFront();
             }
 
-            if (_toolStrip.Visible)
+            if (_captionChromePanel.Visible)
             {
-                _toolStrip.BringToFront();
+                _captionChromePanel.BringToFront();
             }
 
             if (_statusStrip.Visible)
@@ -8979,7 +10083,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 ? "No live stream chat is available for the current stream selection."
                 : emptyMessage.Trim();
 
-            ApplyBigscreenExternalChatLayout(enabled && IsBigscreenPage());
+            ApplyBigscreenDualChatLayout(enabled && IsBigscreenPage());
 
             if (!_browserReady || _dualChatView.CoreWebView2 == null)
             {
@@ -9159,60 +10263,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             _dualChatView.CoreWebView2.Navigate(targetUri);
         }
 
-        private bool TryForceBigscreenEmbedRoute()
-        {
-            if (_webView == null || _webView.Source == null)
-            {
-                return false;
-            }
-
-            Uri currentSource = _webView.Source;
-            if (!currentSource.AbsolutePath.StartsWith("/bigscreen", StringComparison.OrdinalIgnoreCase))
-            {
-                return false;
-            }
-
-            bool hasStreamFragment = !string.IsNullOrWhiteSpace(currentSource.Fragment) && currentSource.Fragment.Length > 1;
-            if (hasStreamFragment)
-            {
-                return false;
-            }
-
-            BigscreenEmbedState selectedEmbed = GetSelectedBigscreenEmbed();
-            if (selectedEmbed == null || string.IsNullOrWhiteSpace(selectedEmbed.Url))
-            {
-                return false;
-            }
-
-            Uri selectedUri;
-            if (!TryBuildUri(selectedEmbed.Url, out selectedUri))
-            {
-                return false;
-            }
-
-            if (string.Equals(currentSource.AbsoluteUri, selectedUri.AbsoluteUri, StringComparison.OrdinalIgnoreCase))
-            {
-                return false;
-            }
-
-            // #region agent log
-            AgentDebugLog.Write(
-                "pre-fix",
-                "M2",
-                "DestinyChatDesktop.cs:5690",
-                "Force bigscreen route to selected stream",
-                new Dictionary<string, object>
-                {
-                    { "currentSource", currentSource.AbsoluteUri },
-                    { "selectedSource", selectedUri.AbsoluteUri }
-                });
-            // #endregion
-
-            NavigateToUrl(selectedUri.AbsoluteUri);
-            return true;
-        }
-
-        private async void ApplyBigscreenExternalChatLayout(bool enabled)
+        private async void ApplyBigscreenDualChatLayout(bool enabled)
         {
             if (!_browserReady || _webView.CoreWebView2 == null)
             {
@@ -9354,7 +10405,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
         {
             try
             {
-                JavaScriptSerializer serializer = new JavaScriptSerializer();
+                JavaScriptSerializer serializer = ScriptJson.Serializer;
                 object payload = serializer.DeserializeObject(e.WebMessageAsJson);
                 Dictionary<string, object> message = payload as Dictionary<string, object>;
                 if (message == null || !message.ContainsKey("type"))
@@ -9415,7 +10466,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 return;
             }
 
-            JavaScriptSerializer serializer = new JavaScriptSerializer();
+            JavaScriptSerializer serializer = ScriptJson.Serializer;
             string urlLit = serializer.Serialize(url.Trim());
             string platformLit = serializer.Serialize(platformTrim);
             string mediaIdLit = serializer.Serialize(mediaIdTrim);
@@ -9820,7 +10871,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
         {
             try
             {
-                JavaScriptSerializer serializer = new JavaScriptSerializer();
+                JavaScriptSerializer serializer = ScriptJson.Serializer;
                 object payload = serializer.DeserializeObject(e.WebMessageAsJson);
                 Dictionary<string, object> message = payload as Dictionary<string, object>;
                 if (message == null || !message.ContainsKey("type"))
@@ -9882,61 +10933,9 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             SetStatus("Opened bigscreen. Click Chat to return to chat-only view.");
         }
 
-        private void OnBigscreenEmbedsResize(object sender, EventArgs e)
-        {
-            LayoutBigscreenEmbeds();
-        }
-
         private void OnBigscreenBarPanelResize(object sender, EventArgs e)
         {
             LayoutBigscreenBarRows();
-        }
-
-        private void OnBigscreenEmbedsMouseEnter(object sender, EventArgs e)
-        {
-            _bigscreenEmbedsViewport.Focus();
-        }
-
-        private void OnBigscreenEmbedsMouseWheel(object sender, MouseEventArgs e)
-        {
-            int direction = e.Delta < 0 ? 1 : -1;
-            ScrollBigscreenEmbedsBy(direction * 140);
-        }
-
-        private void ScrollBigscreenEmbedsBy(int delta)
-        {
-            int maxOffset = GetMaxBigscreenEmbedScrollOffset();
-            if (maxOffset <= 0)
-            {
-                _bigscreenEmbedScrollOffset = 0;
-                LayoutBigscreenEmbeds();
-                return;
-            }
-
-            _bigscreenEmbedScrollOffset = Math.Max(0, Math.Min(maxOffset, _bigscreenEmbedScrollOffset + delta));
-            LayoutBigscreenEmbeds();
-        }
-
-        private int GetMaxBigscreenEmbedScrollOffset()
-        {
-            int totalWidth = _bigscreenEmbedsPanel.PreferredSize.Width;
-            int viewportWidth = _bigscreenEmbedsViewport.ClientSize.Width;
-            return Math.Max(0, totalWidth - viewportWidth);
-        }
-
-        private void LayoutBigscreenEmbeds()
-        {
-            int viewportHeight = Math.Max(0, _bigscreenEmbedsViewport.ClientSize.Height);
-            int totalWidth = Math.Max(_bigscreenEmbedsViewport.ClientSize.Width, _bigscreenEmbedsPanel.PreferredSize.Width);
-            int maxOffset = GetMaxBigscreenEmbedScrollOffset();
-
-            if (_bigscreenEmbedScrollOffset > maxOffset)
-            {
-                _bigscreenEmbedScrollOffset = maxOffset;
-            }
-
-            _bigscreenEmbedsPanel.Size = new Size(totalWidth, viewportHeight);
-            _bigscreenEmbedsPanel.Location = new Point(-_bigscreenEmbedScrollOffset, 0);
         }
 
         private void LayoutBigscreenBarRows()
@@ -9984,7 +10983,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     ? "No live stream chat is available for the current stream selection."
                     : string.Empty;
 
-                JavaScriptSerializer serializer = new JavaScriptSerializer();
+                JavaScriptSerializer serializer = ScriptJson.Serializer;
                 string outboundJson = serializer.Serialize(payload);
 
                 if (_dualChatHostEnabled)
@@ -10150,40 +11149,6 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 lower.IndexOf("youtube-nocookie.com/embed/") >= 0;
         }
 
-        private void OnBigscreenChipMouseEnter(object sender, EventArgs e)
-        {
-            Control control = sender as Control;
-            if (control != null)
-            {
-                control.Focus();
-            }
-        }
-
-        private void OnBigscreenEmbedClicked(object sender, EventArgs e)
-        {
-            Control control = sender as Control;
-            string url = control != null ? control.Tag as string : null;
-            if (string.IsNullOrWhiteSpace(url))
-            {
-                return;
-            }
-
-            if (IsChatPage())
-            {
-                SelectStreamChatEmbedFromTopBar(url, string.Empty, string.Empty);
-                return;
-            }
-
-            string targetUrl = ResolveBigscreenSelectionUrl(url, null, null);
-            if (string.IsNullOrWhiteSpace(targetUrl))
-            {
-                targetUrl = BigscreenBarUrl;
-            }
-
-            NavigateToUrl(targetUrl);
-            SetStatus("Opened bigscreen selection. Click Chat to return to chat-only view.");
-        }
-
         private string ResolveBigscreenSelectionUrl(string url, string platformHint, string mediaIdHint)
         {
             if (string.IsNullOrWhiteSpace(url))
@@ -10341,6 +11306,132 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             {
                 Text = documentTitle + " - " + _config.Title;
             }
+        }
+
+        private static Font CreateCaptionBarFont(float sizeInPoints, out bool useMarlettGlyphs)
+        {
+            useMarlettGlyphs = false;
+            Font marlett = null;
+            try
+            {
+                marlett = new Font("Marlett", sizeInPoints, FontStyle.Regular, GraphicsUnit.Point);
+                if (string.Equals(marlett.FontFamily.Name, "Marlett", StringComparison.OrdinalIgnoreCase))
+                {
+                    useMarlettGlyphs = true;
+                    return marlett;
+                }
+
+                marlett.Dispose();
+                marlett = null;
+            }
+            catch (ArgumentException)
+            {
+                if (marlett != null)
+                {
+                    marlett.Dispose();
+                }
+            }
+
+            float fallbackSize = Math.Max(9.0f, sizeInPoints - 0.75f);
+            return new Font("Segoe UI Symbol", fallbackSize, FontStyle.Regular, GraphicsUnit.Point);
+        }
+
+        private Button CreateCaptionSystemButton(
+            string marlettText,
+            string accessibleName,
+            EventHandler onClick,
+            Font font,
+            bool isClose)
+        {
+            Button button = new ChromeCaptionButton();
+            button.Text = marlettText;
+            button.AccessibleName = accessibleName;
+            button.Font = font;
+            button.TabStop = false;
+            button.FlatStyle = FlatStyle.Flat;
+            button.FlatAppearance.BorderSize = 0;
+            button.FlatAppearance.BorderColor = Color.Black;
+            button.Size = new Size(46, 40);
+            button.Margin = Padding.Empty;
+            button.Padding = Padding.Empty;
+            button.TabStop = false;
+            button.BackColor = Color.FromArgb(30, 30, 30);
+            button.ForeColor = Color.FromArgb(225, 225, 225);
+            button.Cursor = Cursors.Hand;
+            button.FlatAppearance.MouseOverBackColor = isClose
+                ? Color.FromArgb(232, 17, 35)
+                : Color.FromArgb(55, 55, 55);
+            button.Click += onClick;
+            return button;
+        }
+
+        private void OnCaptionMinimizeClicked(object sender, EventArgs e)
+        {
+            WindowState = FormWindowState.Minimized;
+        }
+
+        private void OnCaptionMaxRestoreClicked(object sender, EventArgs e)
+        {
+            if (WindowState == FormWindowState.Maximized)
+            {
+                WindowState = FormWindowState.Normal;
+                if (_captionSavedNormalBounds.Width > 0 && _captionSavedNormalBounds.Height > 0)
+                {
+                    Bounds = _captionSavedNormalBounds;
+                }
+                else if (RestoreBounds.Width > 0 && RestoreBounds.Height > 0)
+                {
+                    Bounds = RestoreBounds;
+                }
+            }
+            else if (WindowState == FormWindowState.Normal)
+            {
+                _captionSavedNormalBounds = Bounds;
+                WindowState = FormWindowState.Maximized;
+            }
+
+            UpdateCaptionMaxButtonGlyph();
+        }
+
+        private void OnCaptionCloseClicked(object sender, EventArgs e)
+        {
+            Close();
+        }
+
+        private void OnCaptionDragPanelMouseDown(object sender, MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left || !IsHandleCreated)
+            {
+                return;
+            }
+
+            ReleaseCapture();
+            SendMessage(Handle, WmNclButtonDown, (IntPtr)HtCaption, IntPtr.Zero);
+        }
+
+        private void OnCaptionDragPanelDoubleClick(object sender, EventArgs e)
+        {
+            OnCaptionMaxRestoreClicked(sender, e);
+        }
+
+        private void UpdateCaptionMaxButtonGlyph()
+        {
+            if (_captionMaximizeButton == null || _captionMaximizeButton.IsDisposed)
+            {
+                return;
+            }
+
+            bool maxed = WindowState == FormWindowState.Maximized;
+            if (_captionUseMarlettGlyphs)
+            {
+                _captionMaximizeButton.Text = maxed ? "2" : "1";
+            }
+            else
+            {
+                _captionMaximizeButton.Text = maxed ? "\u29C9" : "\u25A1";
+            }
+
+            _captionMaximizeButton.AccessibleName = maxed ? "Restore" : "Maximize";
         }
 
         private void NavigateBigscreenBar()
@@ -11410,7 +12501,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 using (StreamReader reader = new StreamReader(responseStream))
                 {
                     string json = await reader.ReadToEndAsync();
-                    JavaScriptSerializer serializer = new JavaScriptSerializer();
+                    JavaScriptSerializer serializer = ScriptJson.Serializer;
                     object payload = serializer.DeserializeObject(json);
                     Dictionary<string, object> root = payload as Dictionary<string, object>;
                     if (root == null || !root.ContainsKey("data"))
@@ -11652,36 +12743,6 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             }
         }
 
-        private static string GetPlatformBadge(string platform)
-        {
-            string normalized = string.IsNullOrWhiteSpace(platform)
-                ? string.Empty
-                : platform.Trim().ToLowerInvariant();
-
-            switch (normalized)
-            {
-                case "youtube":
-                    return "YT";
-                case "twitch":
-                case "twitch-vod":
-                case "twitch-clip":
-                    return "TW";
-                case "kick":
-                case "kick-vod":
-                    return "K";
-                case "rumble":
-                    return "R";
-                case "facebook":
-                    return "FB";
-                case "vimeo":
-                    return "V";
-                case "angelthump":
-                    return "A";
-                default:
-                    return FormatPlatformLabel(platform);
-            }
-        }
-
         private static string FormatPlatformLabel(string platform)
         {
             if (string.IsNullOrWhiteSpace(platform))
@@ -11711,36 +12772,6 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     return "AngelThump";
                 default:
                     return platform.Trim();
-            }
-        }
-
-        private static Color GetPlatformColor(string platform)
-        {
-            string normalized = string.IsNullOrWhiteSpace(platform)
-                ? string.Empty
-                : platform.Trim().ToLowerInvariant();
-
-            switch (normalized)
-            {
-                case "youtube":
-                    return Color.FromArgb(204, 39, 39);
-                case "twitch":
-                case "twitch-vod":
-                case "twitch-clip":
-                    return Color.FromArgb(130, 92, 235);
-                case "kick":
-                case "kick-vod":
-                    return Color.FromArgb(60, 202, 96);
-                case "rumble":
-                    return Color.FromArgb(58, 176, 110);
-                case "facebook":
-                    return Color.FromArgb(70, 117, 211);
-                case "vimeo":
-                    return Color.FromArgb(72, 178, 230);
-                case "angelthump":
-                    return Color.FromArgb(214, 171, 86);
-                default:
-                    return Color.FromArgb(92, 96, 104);
             }
         }
 
@@ -11837,35 +12868,6 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             }
         }
 
-        private static string TruncateText(string value, int maxLength)
-        {
-            if (string.IsNullOrWhiteSpace(value) || value.Length <= maxLength)
-            {
-                return value;
-            }
-
-            return value.Substring(0, Math.Max(0, maxLength - 1)).TrimEnd() + "…";
-        }
-
-        private void OnEmbedLinkClicked(object sender, EventArgs e)
-        {
-            Control control = sender as Control;
-            string url = control != null ? control.Tag as string : null;
-            if (string.IsNullOrWhiteSpace(url))
-            {
-                return;
-            }
-
-            Uri uri;
-            if (TryBuildUri(url, out uri) && IsAllowedUri(uri))
-            {
-                NavigateToUrl(uri.AbsoluteUri);
-                return;
-            }
-
-            OpenInDefaultBrowser(url);
-        }
-
         private void OnSessionPersistTimerTick(object sender, EventArgs e)
         {
             PersistBrowserSession();
@@ -11885,7 +12887,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
             try
             {
-                JavaScriptSerializer serializer = new JavaScriptSerializer();
+                JavaScriptSerializer serializer = ScriptJson.Serializer;
                 List<CookieState> cookieStates = serializer.Deserialize<List<CookieState>>(File.ReadAllText(_cookiePath));
                 if (cookieStates == null)
                 {
@@ -11975,7 +12977,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     });
                 }
 
-                JavaScriptSerializer serializer = new JavaScriptSerializer();
+                JavaScriptSerializer serializer = ScriptJson.Serializer;
                 File.WriteAllText(_cookiePath, serializer.Serialize(cookieStates));
             }
             catch (Exception ex)
@@ -12043,7 +13045,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     Bounds = _savedBounds;
                 }
 
-                _toolStrip.Visible = true;
+                _captionChromePanel.Visible = true;
                 _isFullScreen = false;
                 LayoutDualChatPanel();
                 SetStatus("Exited fullscreen.");
@@ -12054,7 +13056,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             _savedWindowState = WindowState;
             _savedBounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
 
-            _toolStrip.Visible = false;
+            _captionChromePanel.Visible = false;
             FormBorderStyle = FormBorderStyle.None;
             WindowState = FormWindowState.Maximized;
             _isFullScreen = true;
@@ -12093,7 +13095,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
         private static void SendSnipHotkey()
         {
-            // Win+Shift+S — triggers system snip overlay on Windows 10/11
+            // Win+Shift+S â€” triggers system snip overlay on Windows 10/11
             const byte VK_LWIN  = 0x5B;
             const byte VK_SHIFT = 0x10;
             const byte VK_S     = 0x53;
@@ -12113,7 +13115,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 return System.Threading.Tasks.Task.CompletedTask;
             }
 
-            // Injected on every page — only fires on /bigscreen URLs.
+            // Injected on every page â€” only fires on /bigscreen URLs.
             // Detects where the right-side chat area begins vertically and reports it so
             // LayoutDualChatPanel() can start the overlay below the video embeds.
             return _webView.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(@"
@@ -12206,6 +13208,20 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     }
 
                     function getEmbeddedChatFrameTop() {
+                        const frame = getEmbeddedChatFrame();
+                        if (!frame) {
+                            return 0;
+                        }
+
+                        const rect = frame.getBoundingClientRect();
+                        if (rect.height > 20 && rect.width > 20) {
+                            return Math.max(0, Math.round(rect.top));
+                        }
+
+                        return 0;
+                    }
+
+                    function getEmbeddedChatFrame() {
                         const frames = Array.from(document.querySelectorAll('iframe'));
                         for (let i = 0; i < frames.length; i++) {
                             const frame = frames[i];
@@ -12216,11 +13232,11 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
                             const rect = frame.getBoundingClientRect();
                             if (rect.height > 20 && rect.width > 20) {
-                                return Math.max(0, Math.round(rect.top));
+                                return frame;
                             }
                         }
 
-                        return 0;
+                        return null;
                     }
 
                     function getChatInputTop() {
@@ -12330,10 +13346,32 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             ? embeddedChatTop
                             : (selectorTop > 0 ? selectorTop : mediaBottom);
                         const inputTop = getChatInputTop();
+                        const chatFrame = getEmbeddedChatFrame();
+                        const chatTarget = chatFrame && chatFrame.parentElement ? chatFrame.parentElement : chatFrame;
+                        const chatRect = chatTarget ? chatTarget.getBoundingClientRect() : null;
+                        const dualChatActive = !(document.body && document.body.classList.contains('codex-bigscreen-dual-single-chat'));
+                        const paneGap = 14;
+                        const paneLeft = dualChatActive && chatRect
+                            ? Math.max(0, Math.round(chatRect.right + paneGap))
+                            : 0;
+                        const paneTop = dualChatActive && chatRect
+                            ? Math.max(0, Math.round(chatRect.top))
+                            : 0;
+                        const paneWidth = dualChatActive && chatRect
+                            ? Math.max(0, Math.round(chatRect.width))
+                            : 0;
+                        const paneHeight = dualChatActive && chatRect
+                            ? Math.max(0, Math.round(chatRect.height))
+                            : 0;
                         host.postMessage({
                             type: 'codex-bigscreen-layout',
                             chatTop: chatTop,
                             inputTop: inputTop,
+                            layoutActive: dualChatActive,
+                            paneLeft: paneLeft,
+                            paneTop: paneTop,
+                            paneWidth: paneWidth,
+                            paneHeight: paneHeight,
                             windowWidth: Math.round(window.innerWidth || 0),
                             windowHeight: Math.round(window.innerHeight || 0)
                         });
@@ -12489,24 +13527,8 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             } catch (error) {
                             }
 
-                            try {
-                                const parsed = new URL(rawSrc, location.href);
-                                let changed = false;
-                                if ((parsed.searchParams.get('autoplay') || '').toLowerCase() !== 'true') {
-                                    parsed.searchParams.set('autoplay', 'true');
-                                    changed = true;
-                                }
-                                if ((parsed.searchParams.get('muted') || '').toLowerCase() !== 'true') {
-                                    parsed.searchParams.set('muted', 'true');
-                                    changed = true;
-                                }
-
-                                const nextSrc = parsed.toString();
-                                if (changed && nextSrc !== rawSrc) {
-                                    frame.setAttribute('src', nextSrc);
-                                }
-                            } catch (error) {
-                            }
+                            // Do not rewrite iframe src here. This function runs periodically, and assigning
+                            // a new src to an already-loaded Kick player reloads playback and can leave it paused.
                         }
                     }
 
@@ -12557,11 +13579,12 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         if (streamButtonFound) {
                             const shouldRelay = lastEmbeddedStreamChatEnabled !== streamChatEnabled &&
                                 (streamChatEnabled || observedEnabledStreamChatOnce);
+                            const shouldRefreshEnabledHost = !!streamChatEnabled;
                             lastEmbeddedStreamChatEnabled = streamChatEnabled;
                             if (streamChatEnabled) {
                                 observedEnabledStreamChatOnce = true;
                             }
-                            if (shouldRelay) {
+                            if (shouldRelay || shouldRefreshEnabledHost) {
                                 try {
                                     host.postMessage({
                                         type: 'codex-bigscreen-dual-toggle',
@@ -12670,10 +13693,34 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             }
                         };
 
+                        const splitTarget = (el, split) => {
+                            if (!el) return;
+                            if (split) {
+                                setImportantStyle(el, 'display', '');
+                                setImportantStyle(el, 'width', 'calc((100% - 14px) / 2)');
+                                setImportantStyle(el, 'max-width', 'calc((100% - 14px) / 2)');
+                                setImportantStyle(el, 'min-width', '0');
+                                setImportantStyle(el, 'flex', '0 1 calc((100% - 14px) / 2)');
+                                setImportantStyle(el, 'box-sizing', 'border-box');
+                                setImportantStyle(el, 'overflow', 'hidden');
+                            } else {
+                                removeInlineStyle(el, 'display');
+                                removeInlineStyle(el, 'width');
+                                removeInlineStyle(el, 'max-width');
+                                removeInlineStyle(el, 'min-width');
+                                removeInlineStyle(el, 'flex');
+                                removeInlineStyle(el, 'box-sizing');
+                                removeInlineStyle(el, 'overflow');
+                            }
+                        };
+
                         const kickChatTarget = kickChatFrame && kickChatFrame.parentElement ? kickChatFrame.parentElement : kickChatFrame;
                         const chatTarget = chatFrame && chatFrame.parentElement ? chatFrame.parentElement : chatFrame;
                         hideTarget(kickChatTarget, !streamChatEnabled);
+                        splitTarget(kickChatTarget, streamChatEnabled);
+                        splitTarget(chatTarget, streamChatEnabled);
                         fillTarget(chatTarget, !streamChatEnabled);
+                        reportLayout();
                     }
 
                     function ensureBigscreenChatClampStyle() {
@@ -12797,16 +13844,14 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
         private const int WmNclButtonDown = 0x00A1;
         private const int HtClient = 1;
         private const int HtCaption = 2;
-        private const int HtLeft = 10;
-        private const int HtRight = 11;
-        private const int HtTop = 12;
         private const int HtTopLeft = 13;
         private const int HtTopRight = 14;
-        private const int HtBottom = 15;
         private const int HtBottomLeft = 16;
         private const int HtBottomRight = 17;
-        private const int ResizeBorderThickness = 8;
-        private const int DragBandHeight = 28;
+        // Corner hit size; keep in sync with injected script `corner` (44).
+        private const int CornerResizeHitThickness = 44;
+        // Top-of-page pixels reserved for Kick extension chrome; host window-drag does not start here.
+        private const int KickExtensionChromeReservePx = 52;
         private const int WmszTopLeft = 4;
         private const int WmszTopRight = 5;
         private const int WmszBottomLeft = 7;
@@ -12816,11 +13861,8 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
         private readonly MediaPopoutTarget _target;
         private readonly WebView2 _webView;
         private readonly Button _closeButton;
-        private readonly Button _pauseButton;
         private readonly Timer _overlayTimer;
         private readonly double _aspectRatio;
-        private bool _isPlaybackPaused;
-        private bool _pauseUsedMuteFallback;
         private bool _isClosing;
 
         [StructLayout(LayoutKind.Sequential)]
@@ -12860,9 +13902,6 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             Controls.Add(_webView);
 
             _closeButton = CreateOverlayButton("X", new Size(34, 34), OnCloseButtonClicked);
-            _pauseButton = CreateOverlayButton("||", new Size(64, 64), OnPauseButtonClicked);
-            _pauseButton.Font = new Font("Segoe UI", 18.0f, FontStyle.Bold);
-            Controls.Add(_pauseButton);
             Controls.Add(_closeButton);
 
             _overlayTimer = new Timer();
@@ -12892,13 +13931,13 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 _webView.CoreWebView2.Settings.AreBrowserAcceleratorKeysEnabled = true;
                 _webView.CoreWebView2.Settings.IsStatusBarEnabled = false;
                 _webView.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
+                await KickstinyInjector.RegisterAsync(_webView.CoreWebView2, _storageRoot);
                 await RegisterInteractionScriptAsync();
                 _webView.MouseMove += OnInteractiveSurfaceMouseActivity;
                 _webView.MouseEnter += OnInteractiveSurfaceMouseActivity;
                 _webView.MouseLeave += OnInteractiveSurfaceMouseLeave;
-                _webView.MouseDown += OnDragSurfaceMouseDown;
                 _closeButton.MouseMove += OnInteractiveSurfaceMouseActivity;
-                _pauseButton.MouseMove += OnInteractiveSurfaceMouseActivity;
+
                 LayoutOverlayButtons();
                 UpdateOverlayVisibility();
                 _overlayTimer.Start();
@@ -12964,8 +14003,9 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         return;
                     }
 
-                    const corner = 16;
-                    let lastZone = '';
+                    const corner = 44;
+                    const edge = 22;
+                    const kickExtensionChromeReserve = 52;
 
                     function getZone(x, y) {
                         const width = window.innerWidth || document.documentElement.clientWidth || 0;
@@ -12979,16 +14019,84 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         if (top && right) return 'top-right';
                         if (bottom && left) return 'bottom-left';
                         if (bottom && right) return 'bottom-right';
+
                         return '';
                     }
 
-                    function sendHover(zone) {
-                        if (zone === lastZone) {
+                    function isNonCornerEdgeBand(x, y) {
+                        const width = window.innerWidth || document.documentElement.clientWidth || 0;
+                        const height = window.innerHeight || document.documentElement.clientHeight || 0;
+                        const inCorner =
+                            (x <= corner && y <= corner) ||
+                            (x >= width - corner && y <= corner) ||
+                            (x <= corner && y >= height - corner) ||
+                            (x >= width - corner && y >= height - corner);
+                        if (inCorner) {
+                            return false;
+                        }
+
+                        const nearLeft = x <= edge;
+                        const nearRight = x >= width - edge;
+                        const nearTop = y <= edge;
+                        const nearBottom = y >= height - edge;
+                        return nearLeft || nearRight || nearTop || nearBottom;
+                    }
+
+                    function shouldStartHostMove(x, y, target) {
+                        if (getZone(x, y)) {
+                            return false;
+                        }
+
+                        if (isNonCornerEdgeBand(x, y)) {
+                            return false;
+                        }
+
+                        if (y < kickExtensionChromeReserve) {
+                            return false;
+                        }
+
+                        if (target && target.closest && target.closest('video')) {
+                            return false;
+                        }
+
+                        return true;
+                    }
+
+                    (function ensurePopoutCursorStyle() {
+                        const id = 'codex-popout-cursor-style';
+                        if (document.getElementById(id)) {
                             return;
                         }
 
-                        lastZone = zone;
-                        host.postMessage({ type: 'pip-hover', zone: zone });
+                        const st = document.createElement('style');
+                        st.id = id;
+                        st.textContent =
+                            'html.codex-popout-cursor-nwse,html.codex-popout-cursor-nwse *{cursor:nwse-resize!important;}' +
+                            'html.codex-popout-cursor-nesw,html.codex-popout-cursor-nesw *{cursor:nesw-resize!important;}';
+                        (document.head || document.documentElement).appendChild(st);
+                    })();
+
+                    const cursorClassPrefixes = [
+                        'codex-popout-cursor-nwse',
+                        'codex-popout-cursor-nesw'
+                    ];
+
+                    function applyWebCursor(zone) {
+                        const root = document.documentElement;
+                        for (let i = 0; i < cursorClassPrefixes.length; i++) {
+                            root.classList.remove(cursorClassPrefixes[i]);
+                        }
+
+                        const z = (zone || '').trim().toLowerCase();
+                        if (z === 'top-left' || z === 'bottom-right') {
+                            root.classList.add('codex-popout-cursor-nwse');
+                        } else if (z === 'top-right' || z === 'bottom-left') {
+                            root.classList.add('codex-popout-cursor-nesw');
+                        }
+                    }
+
+                    function sendHover(zone) {
+                        applyWebCursor(zone);
                     }
 
                     window.addEventListener('mousemove', (event) => {
@@ -13004,10 +14112,18 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             return;
                         }
 
-                        const zone = getZone(event.clientX, event.clientY);
-                        host.postMessage({ type: 'pip-press', zone: zone || 'move' });
-                        event.preventDefault();
-                        event.stopPropagation();
+                        const x = event.clientX;
+                        const y = event.clientY;
+                        let zone = getZone(x, y);
+                        if (!zone && shouldStartHostMove(x, y, event.target)) {
+                            zone = 'move';
+                        }
+
+                        if (zone) {
+                            host.postMessage({ type: 'pip-press', zone: zone });
+                            event.preventDefault();
+                            event.stopPropagation();
+                        }
                     }, true);
 
                     document.addEventListener('dragstart', (event) => {
@@ -13027,8 +14143,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
         {
             try
             {
-                JavaScriptSerializer serializer = new JavaScriptSerializer();
-                object payload = serializer.DeserializeObject(e.WebMessageAsJson);
+                object payload = ScriptJson.Serializer.DeserializeObject(e.WebMessageAsJson);
                 Dictionary<string, object> message = payload as Dictionary<string, object>;
                 if (message == null || !message.ContainsKey("type"))
                 {
@@ -13037,12 +14152,6 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
                 string type = Convert.ToString(message["type"]);
                 string zone = message.ContainsKey("zone") ? Convert.ToString(message["zone"]) : string.Empty;
-
-                if (string.Equals(type, "pip-hover", StringComparison.OrdinalIgnoreCase))
-                {
-                    ApplyInteractionCursor(zone);
-                    return;
-                }
 
                 if (string.Equals(type, "pip-press", StringComparison.OrdinalIgnoreCase))
                 {
@@ -13053,25 +14162,6 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             {
                 // Ignore malformed page messages.
             }
-        }
-
-        private void ApplyInteractionCursor(string zone)
-        {
-            Cursor cursor = Cursors.Default;
-            switch ((zone ?? string.Empty).Trim().ToLowerInvariant())
-            {
-                case "top-left":
-                case "bottom-right":
-                    cursor = Cursors.SizeNWSE;
-                    break;
-                case "top-right":
-                case "bottom-left":
-                    cursor = Cursors.SizeNESW;
-                    break;
-            }
-
-            Cursor = cursor;
-            _webView.Cursor = cursor;
         }
 
         private void BeginWindowInteraction(string zone)
@@ -13127,9 +14217,8 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             _webView.MouseMove -= OnInteractiveSurfaceMouseActivity;
             _webView.MouseEnter -= OnInteractiveSurfaceMouseActivity;
             _webView.MouseLeave -= OnInteractiveSurfaceMouseLeave;
-            _webView.MouseDown -= OnDragSurfaceMouseDown;
             _closeButton.MouseMove -= OnInteractiveSurfaceMouseActivity;
-            _pauseButton.MouseMove -= OnInteractiveSurfaceMouseActivity;
+
             MouseDown -= OnDragSurfaceMouseDown;
         }
 
@@ -13174,74 +14263,52 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             {
                 base.WndProc(ref m);
 
-                if ((int)m.Result == HtClient)
+                // DefWindowProc often returns HTTOP/HTLEFT/etc. on an invisible sizing frame even with
+                // FormBorderStyle.None. We only want corner resize + caption drag; force client elsewhere.
+                Point clientPoint = PointToClient(new Point(
+                    (short)(m.LParam.ToInt32() & 0xFFFF),
+                    (short)((m.LParam.ToInt32() >> 16) & 0xFFFF)));
+
+                int c = CornerResizeHitThickness;
+                int w = ClientSize.Width;
+                int h = ClientSize.Height;
+                bool nearLeft = clientPoint.X >= 0 && clientPoint.X <= c;
+                bool nearRight = clientPoint.X <= w && clientPoint.X >= w - c;
+                bool nearTop = clientPoint.Y >= 0 && clientPoint.Y <= c;
+                bool nearBottom = clientPoint.Y <= h && clientPoint.Y >= h - c;
+
+                if (nearLeft && nearTop)
                 {
-                    Point clientPoint = PointToClient(new Point(
-                        (short)(m.LParam.ToInt32() & 0xFFFF),
-                        (short)((m.LParam.ToInt32() >> 16) & 0xFFFF)));
-
-                    bool left = clientPoint.X >= 0 && clientPoint.X <= ResizeBorderThickness;
-                    bool right = clientPoint.X <= ClientSize.Width && clientPoint.X >= ClientSize.Width - ResizeBorderThickness;
-                    bool top = clientPoint.Y >= 0 && clientPoint.Y <= ResizeBorderThickness;
-                    bool bottom = clientPoint.Y <= ClientSize.Height && clientPoint.Y >= ClientSize.Height - ResizeBorderThickness;
-
-                    if (left && top)
-                    {
-                        m.Result = (IntPtr)HtTopLeft;
-                        return;
-                    }
-
-                    if (right && top)
-                    {
-                        m.Result = (IntPtr)HtTopRight;
-                        return;
-                    }
-
-                    if (left && bottom)
-                    {
-                        m.Result = (IntPtr)HtBottomLeft;
-                        return;
-                    }
-
-                    if (right && bottom)
-                    {
-                        m.Result = (IntPtr)HtBottomRight;
-                        return;
-                    }
-
-                    if (left)
-                    {
-                        m.Result = (IntPtr)HtLeft;
-                        return;
-                    }
-
-                    if (right)
-                    {
-                        m.Result = (IntPtr)HtRight;
-                        return;
-                    }
-
-                    if (top)
-                    {
-                        m.Result = (IntPtr)HtTop;
-                        return;
-                    }
-
-                    if (bottom)
-                    {
-                        m.Result = (IntPtr)HtBottom;
-                        return;
-                    }
-
-                    if (clientPoint.Y <= DragBandHeight &&
-                        !_closeButton.Bounds.Contains(clientPoint) &&
-                        !_pauseButton.Bounds.Contains(clientPoint))
-                    {
-                        m.Result = (IntPtr)HtCaption;
-                        return;
-                    }
+                    m.Result = (IntPtr)HtTopLeft;
+                    return;
                 }
 
+                if (nearRight && nearTop)
+                {
+                    m.Result = (IntPtr)HtTopRight;
+                    return;
+                }
+
+                if (nearLeft && nearBottom)
+                {
+                    m.Result = (IntPtr)HtBottomLeft;
+                    return;
+                }
+
+                if (nearRight && nearBottom)
+                {
+                    m.Result = (IntPtr)HtBottomRight;
+                    return;
+                }
+
+                if (clientPoint.Y >= KickExtensionChromeReservePx &&
+                    !_closeButton.Bounds.Contains(clientPoint))
+                {
+                    m.Result = (IntPtr)HtCaption;
+                    return;
+                }
+
+                m.Result = (IntPtr)HtClient;
                 return;
             }
 
@@ -13314,11 +14381,7 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             }
 
             _closeButton.Location = new Point(Math.Max(8, ClientSize.Width - _closeButton.Width - 10), 10);
-            _pauseButton.Location = new Point(
-                Math.Max(0, (ClientSize.Width - _pauseButton.Width) / 2),
-                Math.Max(0, (ClientSize.Height - _pauseButton.Height) / 2));
             _closeButton.BringToFront();
-            _pauseButton.BringToFront();
         }
 
         private void UpdateOverlayVisibility()
@@ -13333,209 +14396,12 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             bool showButtons = cursorInside;
 
             _closeButton.Visible = showButtons;
-            _pauseButton.Visible = showButtons;
             _closeButton.BringToFront();
-            _pauseButton.BringToFront();
         }
 
         private void OnCloseButtonClicked(object sender, EventArgs e)
         {
             Close();
-        }
-
-        private async void OnPauseButtonClicked(object sender, EventArgs e)
-        {
-            if (_isClosing || _webView.CoreWebView2 == null)
-            {
-                return;
-            }
-
-            try
-            {
-                bool targetPause = !_isPlaybackPaused;
-                // #region agent log
-                AgentDebugLog.Write(
-                    "post-fix",
-                    "P2",
-                    "DestinyChatDesktop.cs:7470",
-                    "Pause button target state",
-                    new Dictionary<string, object>
-                    {
-                        { "targetPause", targetPause },
-                        { "wasPaused", _isPlaybackPaused },
-                        { "usedMuteFallback", _pauseUsedMuteFallback }
-                    });
-                // #endregion
-
-                if (await SetPlaybackWithScriptAsync(targetPause))
-                {
-                    return;
-                }
-
-                if (targetPause)
-                {
-                    if (await _webView.CoreWebView2.TrySuspendAsync())
-                    {
-                        _isPlaybackPaused = true;
-                        _pauseUsedMuteFallback = false;
-                        _pauseButton.Text = ">";
-                        return;
-                    }
-
-                    _webView.CoreWebView2.IsMuted = true;
-                    _isPlaybackPaused = true;
-                    _pauseUsedMuteFallback = true;
-                    _pauseButton.Text = ">";
-                    return;
-                }
-
-                if (_pauseUsedMuteFallback)
-                {
-                    _webView.CoreWebView2.IsMuted = false;
-                    _pauseUsedMuteFallback = false;
-                }
-                else
-                {
-                    _webView.CoreWebView2.Resume();
-                }
-
-                _isPlaybackPaused = false;
-                _pauseButton.Text = "||";
-            }
-            catch
-            {
-                // Best-effort playback control.
-            }
-        }
-
-        public async System.Threading.Tasks.Task<Dictionary<string, object>> RunPauseResumeButtonSelfTestAsync()
-        {
-            Dictionary<string, object> result = new Dictionary<string, object>();
-            try
-            {
-                int attempts = 0;
-                while (_webView.CoreWebView2 == null && attempts < 60)
-                {
-                    attempts++;
-                    await System.Threading.Tasks.Task.Delay(100);
-                }
-
-                if (_webView.CoreWebView2 == null)
-                {
-                    result["ok"] = false;
-                    result["reason"] = "webview-not-ready";
-                    return result;
-                }
-
-                await System.Threading.Tasks.Task.Delay(300);
-                OnPauseButtonClicked(this, EventArgs.Empty);
-                await System.Threading.Tasks.Task.Delay(350);
-                bool pausedAfterFirstClick = _isPlaybackPaused;
-                OnPauseButtonClicked(this, EventArgs.Empty);
-                await System.Threading.Tasks.Task.Delay(350);
-                bool pausedAfterSecondClick = _isPlaybackPaused;
-
-                result["ok"] = pausedAfterFirstClick && !pausedAfterSecondClick;
-                result["pausedAfterFirstClick"] = pausedAfterFirstClick;
-                result["pausedAfterSecondClick"] = pausedAfterSecondClick;
-                result["pauseButtonText"] = _pauseButton.Text ?? string.Empty;
-                return result;
-            }
-            catch (Exception ex)
-            {
-                result["ok"] = false;
-                result["reason"] = "exception";
-                result["error"] = ex.Message;
-                return result;
-            }
-        }
-
-        private async System.Threading.Tasks.Task<bool> SetPlaybackWithScriptAsync(bool pause)
-        {
-            string resultJson = await _webView.CoreWebView2.ExecuteScriptAsync(@"
-                (() => {
-                    function collectMedia() {
-                        const out = [];
-                        function walk(root) {
-                            try {
-                                for (const el of root.querySelectorAll('video, audio')) {
-                                    out.push(el);
-                                }
-                                for (const frame of root.querySelectorAll('iframe')) {
-                                    try {
-                                        const d = frame.contentDocument;
-                                        if (d) {
-                                            walk(d);
-                                        }
-                                    } catch (error) {
-                                    }
-                                }
-                            } catch (error) {
-                            }
-                        }
-                        walk(document);
-                        return out;
-                    }
-
-                    const media = collectMedia();
-                    if (!media.length) {
-                        return { handled: false, paused: false, mediaCount: 0 };
-                    }
-
-                    const shouldPause = " + (pause ? "true" : "false") + @";
-                    if (shouldPause) {
-                        media.forEach((el) => {
-                            try {
-                                el.pause();
-                            } catch (error) {
-                            }
-                        });
-                        return { handled: true, paused: true, mediaCount: media.length };
-                    }
-
-                    media.forEach((el) => {
-                        try {
-                            const playPromise = el.play();
-                            if (playPromise && typeof playPromise.catch === 'function') {
-                                playPromise.catch(() => {});
-                            }
-                        } catch (error) {
-                        }
-                    });
-
-                    return { handled: true, paused: false, mediaCount: media.length };
-                })();
-            ");
-
-            JavaScriptSerializer serializer = new JavaScriptSerializer();
-            Dictionary<string, object> payload = serializer.Deserialize<Dictionary<string, object>>(resultJson);
-            // #region agent log
-            AgentDebugLog.Write(
-                "post-fix",
-                "P2",
-                "DestinyChatDesktop.cs:7578",
-                "Set playback script result",
-                new Dictionary<string, object>
-                {
-                    { "targetPause", pause },
-                    { "resultJson", resultJson ?? string.Empty },
-                    { "payloadParsed", payload != null }
-                });
-            // #endregion
-            if (payload == null || !payload.ContainsKey("handled"))
-            {
-                return false;
-            }
-
-            bool handled = Convert.ToBoolean(payload["handled"]);
-            if (!handled)
-            {
-                return false;
-            }
-
-            _isPlaybackPaused = payload.ContainsKey("paused") && Convert.ToBoolean(payload["paused"]);
-            _pauseButton.Text = _isPlaybackPaused ? ">" : "||";
-            return true;
         }
 
         private static string BuildHostedVideoHtml(string videoUrl)
@@ -13555,11 +14421,302 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
         }
     }
 
+    internal sealed class ChromeToolStrip : ToolStrip
+    {
+        private static readonly Color ChromeBackColor = Color.FromArgb(30, 30, 30);
+        private const int WmPaint = 0x000F;
+
+        protected override bool ShowFocusCues
+        {
+            get { return false; }
+        }
+
+        protected override bool ShowKeyboardCues
+        {
+            get { return false; }
+        }
+
+        protected override void OnGotFocus(EventArgs e)
+        {
+            base.OnGotFocus(e);
+            Invalidate();
+        }
+
+        protected override void OnLostFocus(EventArgs e)
+        {
+            base.OnLostFocus(e);
+            Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            PaintChromeEdges(e.Graphics);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (m.Msg == WmPaint && IsHandleCreated && !IsDisposed)
+            {
+                using (Graphics graphics = CreateGraphics())
+                {
+                    PaintChromeEdges(graphics);
+                }
+            }
+        }
+
+        private void PaintChromeEdges(Graphics graphics)
+        {
+            Rectangle bounds = ClientRectangle;
+            if (bounds.Width <= 1 || bounds.Height <= 1)
+            {
+                return;
+            }
+
+            bounds.Width -= 1;
+            bounds.Height -= 1;
+            using (Pen borderPen = new Pen(Color.Black))
+            {
+                graphics.DrawRectangle(borderPen, bounds);
+            }
+
+            using (Pen innerPen = new Pen(ChromeBackColor))
+            {
+                Rectangle inner = Rectangle.Inflate(bounds, -1, -1);
+                if (inner.Width > 0 && inner.Height > 0)
+                {
+                    graphics.DrawRectangle(innerPen, inner);
+                }
+            }
+        }
+    }
+
+    internal sealed class ChromePanel : Panel
+    {
+        private const int WmPaint = 0x000F;
+        private static readonly Color ChromeBackColor = Color.FromArgb(30, 30, 30);
+
+        public ChromePanel()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint, true);
+            SetStyle(ControlStyles.OptimizedDoubleBuffer, true);
+            SetStyle(ControlStyles.ResizeRedraw, true);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            PaintChromeEdges(e.Graphics, ClientRectangle);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (m.Msg == WmPaint && IsHandleCreated && !IsDisposed)
+            {
+                using (Graphics graphics = CreateGraphics())
+                {
+                    PaintChromeEdges(graphics, ClientRectangle);
+                }
+            }
+        }
+
+        internal static void PaintChromeEdges(Graphics graphics, Rectangle bounds)
+        {
+            if (bounds.Width <= 1 || bounds.Height <= 1)
+            {
+                return;
+            }
+
+            bounds.Width -= 1;
+            bounds.Height -= 1;
+            using (Pen borderPen = new Pen(Color.Black))
+            {
+                graphics.DrawRectangle(borderPen, bounds);
+            }
+
+            Rectangle inner = Rectangle.Inflate(bounds, -1, -1);
+            if (inner.Width > 0 && inner.Height > 0)
+            {
+                using (Pen innerPen = new Pen(ChromeBackColor))
+                {
+                    graphics.DrawRectangle(innerPen, inner);
+                }
+            }
+        }
+    }
+
+    internal sealed class ChromeTableLayoutPanel : TableLayoutPanel
+    {
+        private const int WmPaint = 0x000F;
+
+        public ChromeTableLayoutPanel()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint, true);
+            SetStyle(ControlStyles.OptimizedDoubleBuffer, true);
+            SetStyle(ControlStyles.ResizeRedraw, true);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            ChromePanel.PaintChromeEdges(e.Graphics, ClientRectangle);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (m.Msg == WmPaint && IsHandleCreated && !IsDisposed)
+            {
+                using (Graphics graphics = CreateGraphics())
+                {
+                    ChromePanel.PaintChromeEdges(graphics, ClientRectangle);
+                }
+            }
+        }
+    }
+
+    internal sealed class ChromeFlowLayoutPanel : FlowLayoutPanel
+    {
+        private const int WmPaint = 0x000F;
+
+        public ChromeFlowLayoutPanel()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint, true);
+            SetStyle(ControlStyles.OptimizedDoubleBuffer, true);
+            SetStyle(ControlStyles.ResizeRedraw, true);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            ChromePanel.PaintChromeEdges(e.Graphics, ClientRectangle);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (m.Msg == WmPaint && IsHandleCreated && !IsDisposed)
+            {
+                using (Graphics graphics = CreateGraphics())
+                {
+                    ChromePanel.PaintChromeEdges(graphics, ClientRectangle);
+                }
+            }
+        }
+    }
+
+    internal sealed class ChromeCaptionButton : Button
+    {
+        protected override bool ShowFocusCues
+        {
+            get { return false; }
+        }
+
+        protected override bool ShowKeyboardCues
+        {
+            get { return false; }
+        }
+
+        public override void NotifyDefault(bool value)
+        {
+            base.NotifyDefault(false);
+        }
+
+        protected override void OnPaint(PaintEventArgs pevent)
+        {
+            base.OnPaint(pevent);
+            Rectangle bounds = ClientRectangle;
+            if (bounds.Width <= 1 || bounds.Height <= 1)
+            {
+                return;
+            }
+
+            bounds.Width -= 1;
+            bounds.Height -= 1;
+            using (Pen pen = new Pen(Color.Black))
+            {
+                pevent.Graphics.DrawRectangle(pen, bounds);
+            }
+        }
+    }
+
     internal sealed class BorderlessToolStripRenderer : ToolStripProfessionalRenderer
     {
+        protected override void OnRenderToolStripBackground(ToolStripRenderEventArgs e)
+        {
+            Color backColor = e.ToolStrip != null ? e.ToolStrip.BackColor : Color.FromArgb(30, 30, 30);
+            using (SolidBrush brush = new SolidBrush(backColor))
+            {
+                e.Graphics.FillRectangle(brush, e.AffectedBounds);
+            }
+        }
+
         protected override void OnRenderToolStripBorder(ToolStripRenderEventArgs e)
         {
-            // Intentionally suppress default bottom border line.
+            Rectangle bounds = new Rectangle(Point.Empty, e.ToolStrip.Size);
+            if (bounds.Width <= 1 || bounds.Height <= 1)
+            {
+                return;
+            }
+
+            bounds.Width -= 1;
+            bounds.Height -= 1;
+            using (Pen pen = new Pen(Color.Black))
+            {
+                e.Graphics.DrawRectangle(pen, bounds);
+            }
+        }
+
+        protected override void OnRenderButtonBackground(ToolStripItemRenderEventArgs e)
+        {
+            ToolStripButton button = e.Item as ToolStripButton;
+            if (button == null)
+            {
+                base.OnRenderButtonBackground(e);
+                return;
+            }
+
+            ToolStrip strip = button.Owner as ToolStrip;
+            Color baseBack = strip != null ? strip.BackColor : SystemColors.Control;
+            Color fill = baseBack;
+            Color border = Color.Transparent;
+            if (!button.Enabled)
+            {
+                fill = baseBack;
+            }
+            else if (button.Pressed)
+            {
+                fill = ControlPaint.Dark(baseBack, 0.08f);
+                border = Color.Black;
+            }
+            else if (button.Checked)
+            {
+                fill = ControlPaint.Light(baseBack, 0.18f);
+                border = Color.Black;
+            }
+            else if (button.Selected)
+            {
+                fill = ControlPaint.Light(baseBack, 0.12f);
+                border = Color.Black;
+            }
+
+            Rectangle bounds = new Rectangle(Point.Empty, button.Bounds.Size);
+            using (SolidBrush brush = new SolidBrush(fill))
+            {
+                e.Graphics.FillRectangle(brush, bounds);
+            }
+
+            if (border != Color.Transparent && bounds.Width > 1 && bounds.Height > 1)
+            {
+                bounds.Width -= 1;
+                bounds.Height -= 1;
+                using (Pen pen = new Pen(border))
+                {
+                    e.Graphics.DrawRectangle(pen, bounds);
+                }
+            }
         }
     }
 
@@ -13619,191 +14776,6 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             {
                 return new Size(200, 23);
             }
-        }
-    }
-
-    public sealed class EmbedChip : Control
-    {
-        private bool _hovered;
-        private bool _pressed;
-        private string _badgeText;
-        private bool _isSelected;
-        private Color _accentColor;
-
-        public EmbedChip()
-        {
-            SetStyle(ControlStyles.AllPaintingInWmPaint, true);
-            SetStyle(ControlStyles.UserPaint, true);
-            SetStyle(ControlStyles.OptimizedDoubleBuffer, true);
-            SetStyle(ControlStyles.ResizeRedraw, true);
-            SetStyle(ControlStyles.Selectable, true);
-
-            BackColor = Color.FromArgb(28, 28, 32);
-            ForeColor = Color.FromArgb(222, 222, 228);
-            Font = new Font("Segoe UI", 9.75f, FontStyle.Bold);
-            Size = new Size(200, 28);
-            TabStop = true;
-            _badgeText = string.Empty;
-            _isSelected = false;
-            _accentColor = Color.FromArgb(92, 96, 104);
-        }
-
-        public string BadgeText
-        {
-            get { return _badgeText; }
-            set
-            {
-                _badgeText = value ?? string.Empty;
-                Invalidate();
-            }
-        }
-
-        public bool IsSelected
-        {
-            get { return _isSelected; }
-            set
-            {
-                _isSelected = value;
-                Invalidate();
-            }
-        }
-
-        public Color AccentColor
-        {
-            get { return _accentColor; }
-            set
-            {
-                _accentColor = value;
-                Invalidate();
-            }
-        }
-
-        protected override void OnMouseEnter(EventArgs e)
-        {
-            _hovered = true;
-            Invalidate();
-            base.OnMouseEnter(e);
-        }
-
-        protected override void OnMouseLeave(EventArgs e)
-        {
-            _hovered = false;
-            _pressed = false;
-            Invalidate();
-            base.OnMouseLeave(e);
-        }
-
-        protected override void OnMouseDown(MouseEventArgs e)
-        {
-            if (e.Button == MouseButtons.Left)
-            {
-                _pressed = true;
-                Focus();
-                Invalidate();
-            }
-
-            base.OnMouseDown(e);
-        }
-
-        protected override void OnMouseUp(MouseEventArgs e)
-        {
-            _pressed = false;
-            Invalidate();
-            base.OnMouseUp(e);
-        }
-
-        protected override void OnGotFocus(EventArgs e)
-        {
-            Invalidate();
-            base.OnGotFocus(e);
-        }
-
-        protected override void OnLostFocus(EventArgs e)
-        {
-            Invalidate();
-            base.OnLostFocus(e);
-        }
-
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            base.OnPaint(e);
-
-            Rectangle rect = new Rectangle(0, 0, Width - 1, Height - 1);
-            Color fill = _isSelected
-                ? Color.FromArgb(44, 48, 58)
-                : _pressed
-                    ? Color.FromArgb(42, 42, 48)
-                    : _hovered
-                        ? Color.FromArgb(34, 34, 40)
-                        : BackColor;
-            Color border = Focused
-                ? Color.FromArgb(96, 132, 192)
-                : _isSelected
-                    ? Color.FromArgb(86, 96, 112)
-                    : Color.FromArgb(48, 48, 54);
-            Color textColor = _isSelected
-                ? Color.FromArgb(243, 244, 246)
-                : ForeColor;
-
-            using (SolidBrush fillBrush = new SolidBrush(fill))
-            using (Pen borderPen = new Pen(border))
-            using (SolidBrush badgeBrush = new SolidBrush(_accentColor))
-            using (Font badgeFont = new Font("Segoe UI", 8.0f, FontStyle.Bold))
-            {
-                e.Graphics.FillRectangle(fillBrush, rect);
-                e.Graphics.DrawRectangle(borderPen, rect);
-
-                int left = 8;
-                if (!string.IsNullOrWhiteSpace(_badgeText))
-                {
-                    Rectangle badgeRect = new Rectangle(8, 5, Math.Min(34, Math.Max(24, 14 + (_badgeText.Length * 7))), Height - 10);
-                    e.Graphics.FillRectangle(badgeBrush, badgeRect);
-
-                    TextRenderer.DrawText(
-                        e.Graphics,
-                        _badgeText,
-                        badgeFont,
-                        badgeRect,
-                        Color.FromArgb(248, 248, 248),
-                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
-
-                    left = badgeRect.Right + 8;
-                }
-
-                Rectangle textRect = new Rectangle(left, 0, Math.Max(0, Width - left - 8), Height);
-                TextRenderer.DrawText(
-                    e.Graphics,
-                    Text,
-                    Font,
-                    textRect,
-                    textColor,
-                    TextFormatFlags.Left |
-                    TextFormatFlags.VerticalCenter |
-                    TextFormatFlags.EndEllipsis |
-                    TextFormatFlags.NoPrefix |
-                    TextFormatFlags.SingleLine);
-            }
-        }
-
-        protected override bool IsInputKey(Keys keyData)
-        {
-            if (keyData == Keys.Enter || keyData == Keys.Space)
-            {
-                return true;
-            }
-
-            return base.IsInputKey(keyData);
-        }
-
-        protected override void OnKeyDown(KeyEventArgs e)
-        {
-            if (e.KeyCode == Keys.Enter || e.KeyCode == Keys.Space)
-            {
-                OnClick(EventArgs.Empty);
-                e.Handled = true;
-            }
-
-            base.OnKeyDown(e);
         }
     }
 
