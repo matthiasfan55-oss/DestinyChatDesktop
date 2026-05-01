@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <UseWindowsForms>true</UseWindowsForms>
+    <RootNamespace>DestinyChatDesktop.Embedded</RootNamespace>
+    <AssemblyName>DestinyChatDesktop.EmbeddedWinForms</AssemblyName>
+    <Deterministic>true</Deterministic>
+    <LangVersion>latest</LangVersion>
+    <!-- Single-file legacy UI surface; suppress noisy nullable warnings until split further -->
+    <NoWarn>$(NoWarn);CS8632;CS8981</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2957.106" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- WPF entry assembly is named DestinyChatDesktop (see Wpf csproj). -->
+    <InternalsVisibleTo Include="DestinyChatDesktop" />
+    <InternalsVisibleTo Include="DestinyChatDesktop.Tests" />
+  </ItemGroup>
+</Project>
