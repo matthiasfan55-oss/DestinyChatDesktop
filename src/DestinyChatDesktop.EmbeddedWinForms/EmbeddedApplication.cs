@@ -681,6 +681,7 @@ namespace DestinyChatDesktop.Embedded
             _toolStrip.Items.Add(_goButton);
             _toolStrip.Items.Add(_browserButton);
             _toolStrip.Items.Add(_pinButton);
+            _toolStrip.Items.Add(_updateButton);
             _toolStrip.Items.Add(new ToolStripSeparator());
             _toolStrip.Items.Add(_zoomOutButton);
             _toolStrip.Items.Add(_zoomResetButton);
