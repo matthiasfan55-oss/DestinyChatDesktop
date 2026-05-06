@@ -802,6 +802,7 @@ namespace DestinyChatDesktop
             _dualChatView.CoreWebView2.Settings.IsStatusBarEnabled = false;
             _dualChatView.CoreWebView2.IsMuted = true;
             _dualChatView.CoreWebView2.NewWindowRequested += OnDualChatNewWindowRequested;
+            _dualChatView.NavigationCompleted += OnDualChatNavigationCompleted;
 
             // Inject CSS to hide the YouTube live chat header (shown in popout mode)
             // so only the message list and input are visible.
@@ -4737,6 +4738,52 @@ try {
             }
         }
 
+        private void OnDualChatNavigationCompleted(object sender, CoreWebView2NavigationCompletedEventArgs e)
+        {
+            // If a stream chat URL is blocked from embedding (some providers
+            // refuse to render certain pages outside their own site/iframe),
+            // surface a clear status message and offer to open it externally
+            // rather than leaving the user staring at a blocked-content page.
+            if (e.IsSuccess)
+            {
+                return;
+            }
+
+            string requested = _dualChatRequestedUrl;
+            if (string.IsNullOrWhiteSpace(requested))
+            {
+                return;
+            }
+
+            switch (e.WebErrorStatus)
+            {
+                case CoreWebView2WebErrorStatus.ConnectionAborted:
+                case CoreWebView2WebErrorStatus.OperationCanceled:
+                    return;
+                default:
+                    break;
+            }
+
+            System.Diagnostics.Debug.WriteLine(
+                "[DualChat] Navigation failed (" + e.WebErrorStatus + ") for: " + requested);
+            SetStatus("Stream chat could not embed. Opening it in your default browser.");
+            OpenInDefaultBrowser(requested);
+
+            try
+            {
+                if (_dualChatView.CoreWebView2 != null)
+                {
+                    _dualChatView.CoreWebView2.Navigate("about:blank");
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("[DualChat] Reset to about:blank failed: " + ex);
+            }
+
+            _dualChatRequestedUrl = null;
+        }
+
         private void OnMainFormResize(object sender, EventArgs e)
         {
             LayoutDualChatPanel();
@@ -4842,7 +4889,17 @@ try {
             LayoutDualChatPanel();
             _dualChatPanel.Visible = true;
 
-            if (_dualChatHostAvailable && !string.IsNullOrWhiteSpace(chatUrl))
+            // Defense in depth: only navigate the dual-chat WebView to http/https
+            // URLs. The chat URL is built from upstream embed metadata, so guard
+            // against any future caller passing an unsupported scheme.
+            Uri parsedChatUri;
+            bool chatUrlIsValid = _dualChatHostAvailable
+                && !string.IsNullOrWhiteSpace(chatUrl)
+                && Uri.TryCreate(chatUrl, UriKind.Absolute, out parsedChatUri)
+                && (parsedChatUri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+                    || parsedChatUri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase));
+
+            if (chatUrlIsValid)
             {
                 bool requestedUrlChanged = !string.Equals(_dualChatRequestedUrl, chatUrl, StringComparison.OrdinalIgnoreCase);
                 bool needsInitialNavigation = _dualChatView.Source == null ||
@@ -5749,11 +5806,12 @@ try {
                 return null;
             }
 
-            return "https://www.twitch.tv/embed/"
+            // The /embed/<channel>/chat path is iframe-only and shows
+            // "This content is blocked" if loaded as a top-level page.
+            // The dual-chat WebView2 navigates top-level, so use /popout instead.
+            return "https://www.twitch.tv/popout/"
                 + Uri.EscapeDataString(channel)
-                + "/chat?parent="
-                + Uri.EscapeDataString(DefaultTwitchParent)
-                + "&darkpopout=1";
+                + "/chat?popout=";
         }
 
         private static string BuildYouTubeChatUrl(string mediaId)
@@ -5805,11 +5863,10 @@ try {
                 return null;
             }
 
-            return "https://clips.twitch.tv/embed?clip="
-                + Uri.EscapeDataString(clipId)
-                + "&parent="
-                + Uri.EscapeDataString(DefaultTwitchParent)
-                + "&autoplay=true";
+            // The /embed clip URL is iframe-only and refuses to render as a
+            // top-level page. The MediaPopoutForm navigates top-level, so use
+            // the standalone clip page which embeds its own player.
+            return "https://clips.twitch.tv/" + Uri.EscapeDataString(clipId);
         }
 
         private static string BuildYouTubePlayerUrl(string mediaId)
@@ -5882,9 +5939,14 @@ try {
                 return null;
             }
 
-            return "https://www.facebook.com/plugins/video.php?href=https://www.facebook.com/"
-                + Uri.EscapeDataString(facebookId)
-                + "&width=1920&height=1080&autoplay=true";
+            // The plugins/video.php iframe page refuses to render top-level
+            // and shows "This content is blocked. Contact the site owner...".
+            // The popout form navigates top-level, so route to the canonical
+            // facebook.com video URL instead. Path segments may include
+            // "user/videos/<id>" so we keep the supplied path as-is and only
+            // escape characters that would break the URL.
+            string normalized = facebookId.TrimStart('/');
+            return "https://www.facebook.com/" + Uri.EscapeUriString(normalized);
         }
 
         private static string BuildAngelthumpPlayerUrl(string mediaId)
@@ -6124,16 +6186,40 @@ try {
 
         private void OpenInDefaultBrowser(string url)
         {
+            // Only open http/https URLs in the user's shell. Process.Start with
+            // UseShellExecute=true would otherwise launch javascript:, file:, or
+            // arbitrary protocol handlers for any URL that fell out of the
+            // in-app allow-list.
+            Uri uri;
+            if (!Uri.TryCreate(url, UriKind.Absolute, out uri))
+            {
+                SetStatus("Could not open the browser: invalid URL.");
+                return;
+            }
+
+            if (!uri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) &&
+                !uri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+            {
+                System.Diagnostics.Debug.WriteLine("[OpenInDefaultBrowser] Refusing non-http(s) scheme: " + uri.Scheme);
+                SetStatus("Did not open link with unsupported scheme: " + uri.Scheme);
+                return;
+            }
+
             try
             {
-                Process.Start(new ProcessStartInfo
+                Process started = Process.Start(new ProcessStartInfo
                 {
-                    FileName = url,
+                    FileName = uri.AbsoluteUri,
                     UseShellExecute = true
                 });
+                if (started != null)
+                {
+                    started.Dispose();
+                }
             }
             catch (Exception ex)
             {
+                System.Diagnostics.Debug.WriteLine("[OpenInDefaultBrowser] Process.Start failed: " + ex);
                 SetStatus("Could not open the browser: " + ex.Message);
             }
         }
@@ -6754,6 +6840,8 @@ try {
                 _webView.CoreWebView2.Settings.AreBrowserAcceleratorKeysEnabled = true;
                 _webView.CoreWebView2.Settings.IsStatusBarEnabled = false;
                 _webView.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
+                _webView.NavigationCompleted += OnPlayerNavigationCompleted;
+                _webView.CoreWebView2.NewWindowRequested += OnPlayerNewWindowRequested;
                 await RegisterInteractionScriptAsync();
                 _webView.MouseMove += OnInteractiveSurfaceMouseActivity;
                 _webView.MouseEnter += OnInteractiveSurfaceMouseActivity;
@@ -6921,6 +7009,99 @@ try {
 
             Cursor = cursor;
             _webView.Cursor = cursor;
+        }
+
+        private void OnPlayerNavigationCompleted(object sender, CoreWebView2NavigationCompletedEventArgs e)
+        {
+            if (e.IsSuccess || _isClosing)
+            {
+                return;
+            }
+
+            switch (e.WebErrorStatus)
+            {
+                case CoreWebView2WebErrorStatus.ConnectionAborted:
+                case CoreWebView2WebErrorStatus.OperationCanceled:
+                    return;
+                default:
+                    break;
+            }
+
+            string playerUrl = _target != null ? _target.PlayerUrl : null;
+            if (string.IsNullOrWhiteSpace(playerUrl))
+            {
+                return;
+            }
+
+            // The popout uses NavigateToString for hosted-video targets, so a
+            // failed top-level Navigate here points at a provider blocking the
+            // embed. Hand off to the OS browser instead of leaving the user on
+            // a "This content is blocked" page.
+            System.Diagnostics.Debug.WriteLine(
+                "[MediaPopout] Player navigation failed (" + e.WebErrorStatus + ") for: " + playerUrl);
+
+            try
+            {
+                Process started = Process.Start(new ProcessStartInfo
+                {
+                    FileName = playerUrl,
+                    UseShellExecute = true
+                });
+                if (started != null)
+                {
+                    started.Dispose();
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("[MediaPopout] External open failed: " + ex);
+            }
+
+            Close();
+        }
+
+        private void OnPlayerNewWindowRequested(object sender, CoreWebView2NewWindowRequestedEventArgs e)
+        {
+            // Prevent providers from spawning their own popups inside the PiP
+            // window (e.g., Twitch player "watch on Twitch" links). Send those
+            // to the user's default browser so they keep working without
+            // hijacking the picture-in-picture surface.
+            e.Handled = true;
+
+            string requestedUri = e == null ? null : e.Uri;
+            if (string.IsNullOrWhiteSpace(requestedUri))
+            {
+                return;
+            }
+
+            Uri parsed;
+            if (!Uri.TryCreate(requestedUri, UriKind.Absolute, out parsed))
+            {
+                return;
+            }
+
+            if (!parsed.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) &&
+                !parsed.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            try
+            {
+                Process started = Process.Start(new ProcessStartInfo
+                {
+                    FileName = parsed.AbsoluteUri,
+                    UseShellExecute = true
+                });
+                if (started != null)
+                {
+                    started.Dispose();
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("[MediaPopout] New window open failed: " + ex);
+            }
         }
 
         private void BeginWindowInteraction(string zone)
