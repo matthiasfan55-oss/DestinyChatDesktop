@@ -11360,11 +11360,10 @@ try {
                 source = _dualChatView.Source.AbsoluteUri;
             }
 
-            // #region agent log
             AgentDebugLog.Write(
-                "pre-fix",
+                "post-fix",
                 "K2",
-                "DestinyChatDesktop.cs:5365",
+                "EmbeddedApplication.cs:OnDualChatNavigationCompleted",
                 "Dual chat navigation completed",
                 new Dictionary<string, object>
                 {
@@ -11373,10 +11372,28 @@ try {
                     { "source", source },
                     { "requestedUrl", _dualChatRequestedUrl ?? string.Empty }
                 });
-            // #endregion
 
             if (_dualChatView == null || _dualChatView.CoreWebView2 == null)
             {
+                return;
+            }
+
+            // If navigation failed for a reason other than user-cancel/abort, hand the URL
+            // off to the default browser and reset the panel so the user isn't left staring
+            // at a blocked-content page.
+            if (e != null && !e.IsSuccess &&
+                e.WebErrorStatus != CoreWebView2WebErrorStatus.OperationCanceled &&
+                e.WebErrorStatus != CoreWebView2WebErrorStatus.ConnectionAborted)
+            {
+                string fallbackUrl = _dualChatRequestedUrl ?? source;
+                if (!string.IsNullOrWhiteSpace(fallbackUrl) &&
+                    !string.Equals(fallbackUrl, "about:blank", StringComparison.OrdinalIgnoreCase))
+                {
+                    SetStatus("Stream chat blocked — opening in browser.");
+                    OpenInDefaultBrowser(fallbackUrl);
+                }
+
+                NavigateDualChatViewIfNeeded("about:blank");
                 return;
             }
 
@@ -11697,6 +11714,24 @@ try {
 
             if (available && !string.IsNullOrWhiteSpace(chatUrl))
             {
+                // Validate that chatUrl is an absolute http/https URL before navigating.
+                // Non-http schemes (or relative paths) would cause WebView2 to load a
+                // blocked-content page or an error page.
+                Uri parsedChat;
+                bool chatUrlValid = Uri.TryCreate(chatUrl, UriKind.Absolute, out parsedChat) &&
+                    (string.Equals(parsedChat.Scheme, "http", StringComparison.OrdinalIgnoreCase) ||
+                     string.Equals(parsedChat.Scheme, "https", StringComparison.OrdinalIgnoreCase));
+
+                if (!chatUrlValid)
+                {
+                    _dualChatView.Visible = false;
+                    _dualChatEmptyLabel.Text = _dualChatEmptyMessage;
+                    _dualChatEmptyLabel.Visible = true;
+                    _dualChatEmptyLabel.BringToFront();
+                    NavigateDualChatViewIfNeeded("about:blank");
+                    return;
+                }
+
                 string streamNavUri = NormalizeKickStreamChatNavigationUrl(chatUrl);
                 _dualChatEmptyLabel.Visible = false;
                 _dualChatView.Visible = true;
@@ -13892,11 +13927,11 @@ try {
                 return null;
             }
 
-            return "https://www.twitch.tv/embed/"
+            // /embed/.../chat is iframe-only and returns the blocked-content page when
+            // loaded as a top-level document.  Use the popout route instead.
+            return "https://www.twitch.tv/popout/"
                 + Uri.EscapeDataString(channel)
-                + "/chat?parent="
-                + Uri.EscapeDataString(DefaultTwitchParent)
-                + "&darkpopout=1";
+                + "/chat?popout=";
         }
 
         private static string BuildYouTubeChatUrl(string mediaId, bool useEmbeddedHost)
@@ -13996,11 +14031,9 @@ try {
                 return null;
             }
 
-            return "https://clips.twitch.tv/embed?clip="
-                + Uri.EscapeDataString(clipId)
-                + "&parent="
-                + Uri.EscapeDataString(DefaultTwitchParent)
-                + "&autoplay=true";
+            // /embed?clip=... is iframe-only and returns the blocked-content page as a
+            // top-level document.  The bare clip slug page carries its own player and loads fine.
+            return "https://clips.twitch.tv/" + Uri.EscapeDataString(clipId);
         }
 
         private static string BuildYouTubePlayerUrl(string mediaId)
@@ -14073,9 +14106,9 @@ try {
                 return null;
             }
 
-            return "https://www.facebook.com/plugins/video.php?href=https://www.facebook.com/"
-                + Uri.EscapeDataString(facebookId)
-                + "&width=1920&height=1080&autoplay=true";
+            // plugins/video.php always returns the blocked-content page top-level.
+            // The canonical facebook.com/<id> page carries its own player.
+            return "https://www.facebook.com/" + Uri.EscapeDataString(facebookId);
         }
 
         private static string BuildAngelthumpPlayerUrl(string mediaId)
@@ -14336,28 +14369,43 @@ try {
 
         private void OpenInDefaultBrowser(string url)
         {
+            if (string.IsNullOrWhiteSpace(url))
+            {
+                return;
+            }
+
+            Uri uri;
+            if (!Uri.TryCreate(url, UriKind.Absolute, out uri) ||
+                (!string.Equals(uri.Scheme, "http", StringComparison.OrdinalIgnoreCase) &&
+                 !string.Equals(uri.Scheme, "https", StringComparison.OrdinalIgnoreCase)))
+            {
+                return;
+            }
+
             try
             {
-                Process.Start(new ProcessStartInfo
+                Process started = Process.Start(new ProcessStartInfo
                 {
-                    FileName = url,
+                    FileName = uri.AbsoluteUri,
                     UseShellExecute = true
                 });
+                if (started != null)
+                {
+                    started.Dispose();
+                }
             }
             catch (Exception ex)
             {
-                // #region agent log
                 AgentDebugLog.Write(
-                    "pre-fix",
+                    "post-fix",
                     "N3",
-                    "DestinyChatDesktop.cs:6366",
+                    "EmbeddedApplication.cs:OpenInDefaultBrowser",
                     "Open in browser failed",
                     new Dictionary<string, object>
                     {
-                        { "url", url ?? string.Empty },
+                        { "url", url },
                         { "error", ex.Message }
                     });
-                // #endregion
                 SetStatus("Could not open the browser: " + ex.Message);
             }
         }
@@ -15655,6 +15703,8 @@ try {
                 _webView.CoreWebView2.Settings.AreBrowserAcceleratorKeysEnabled = true;
                 _webView.CoreWebView2.Settings.IsStatusBarEnabled = false;
                 _webView.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
+                _webView.CoreWebView2.NewWindowRequested += OnPlayerNewWindowRequested;
+                _webView.NavigationCompleted += OnPlayerNavigationCompleted;
                 await KickstinyInjector.RegisterAsync(_webView.CoreWebView2, _storageRoot);
                 await RegisterInteractionScriptAsync();
                 _webView.MouseMove += OnInteractiveSurfaceMouseActivity;
@@ -15699,6 +15749,84 @@ try {
                     MessageBoxIcon.Error);
                 Close();
             }
+        }
+
+        private void OnPlayerNavigationCompleted(object sender, CoreWebView2NavigationCompletedEventArgs e)
+        {
+            if (_isClosing || IsDisposed || Disposing)
+            {
+                return;
+            }
+
+            // If the player URL itself returned a blocked-content page, hand off to the
+            // default browser and close the popout so the user isn't stuck staring at it.
+            if (e != null && !e.IsSuccess &&
+                e.WebErrorStatus != CoreWebView2WebErrorStatus.OperationCanceled &&
+                e.WebErrorStatus != CoreWebView2WebErrorStatus.ConnectionAborted)
+            {
+                string fallbackUrl = _target != null ? _target.PlayerUrl : null;
+                if (!string.IsNullOrWhiteSpace(fallbackUrl))
+                {
+                    Uri uri;
+                    if (Uri.TryCreate(fallbackUrl, UriKind.Absolute, out uri) &&
+                        (string.Equals(uri.Scheme, "http", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(uri.Scheme, "https", StringComparison.OrdinalIgnoreCase)))
+                    {
+                        try
+                        {
+                            Process started = Process.Start(new ProcessStartInfo
+                            {
+                                FileName = uri.AbsoluteUri,
+                                UseShellExecute = true
+                            });
+                            if (started != null)
+                            {
+                                started.Dispose();
+                            }
+                        }
+                        catch { }
+                    }
+                }
+
+                if (!_isClosing && IsHandleCreated)
+                {
+                    BeginInvoke(new Action(Close));
+                }
+            }
+        }
+
+        private void OnPlayerNewWindowRequested(object sender, CoreWebView2NewWindowRequestedEventArgs e)
+        {
+            // Providers like Twitch player spawn "Watch on Twitch" child windows.
+            // Route those to the OS default browser instead of letting them hijack the PiP surface.
+            e.Handled = true;
+            string uri = e.Uri;
+            if (string.IsNullOrWhiteSpace(uri))
+            {
+                return;
+            }
+
+            Uri parsed;
+            if (!Uri.TryCreate(uri, UriKind.Absolute, out parsed) ||
+                (!string.Equals(parsed.Scheme, "http", StringComparison.OrdinalIgnoreCase) &&
+                 !string.Equals(parsed.Scheme, "https", StringComparison.OrdinalIgnoreCase)))
+            {
+                return;
+            }
+
+            try
+            {
+                Process started = Process.Start(new ProcessStartInfo
+                {
+                    FileName = parsed.AbsoluteUri,
+                    UseShellExecute = true
+                });
+                if (started != null)
+                {
+                    started.Dispose();
+                }
+            }
+            catch { }
         }
 
         private Button CreateOverlayButton(string text, Size size, EventHandler clickHandler)
