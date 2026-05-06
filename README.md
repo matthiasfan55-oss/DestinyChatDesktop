@@ -47,6 +47,22 @@ Output:
 - Published app: `dist\` (includes `DestinyChatDesktop.exe`, `DestinyChatDesktop.EmbeddedWinForms.dll`, WebView2 loader, `appsettings.json`)
 - Optional zip + checksum: `artifacts\DestinyChatDesktop-portable.zip`, `artifacts\DestinyChatDesktop-portable.sha256`
 
+## Testing (manual checklist)
+
+Automated CI runs **`dotnet build`** and **`dotnet test`** only (no Destiny.gg/E2E in GitHub Actions). After a local build:
+
+1. **Chat load** — App opens, Destiny.gg embed loads, URL bar navigates (`Chat`, typed URL, Enter).
+2. **External links** — Non-allowed hosts open in the default browser; Destiny.gg stays inside.
+3. **Bigscreen** — Bigscreen mode toggles, embed/media layout looks correct vs prior behavior.
+4. **Dual chat** — Split/dual-chat overlay aligns with embedded layout when triggered from the site.
+5. **Toolbar** — Back/forward/home, mute, pin (always-on-top should affect the outer window now), zoom + labels.
+6. **Window chrome** — Drag caption, minimize, maximize/restore icons match real window state, close exits the process.
+7. **Fullscreen** — `F11` maximizes/restores the **outer** window correctly when running the WPF build.
+8. **Media popout** — Popout window opens/closes without errors.
+9. **Updates** — Update button behaves (configured repo/asset); portable zip still installs `DestinyChatDesktop.exe` next to dlls.
+
+Optional self-test flags (see `EmbeddedApplication.cs` / `AppBootstrap`): `--self-test-split`, `--self-test-toolbar`, `--self-test-dual`, `--self-test-bigscreen-geometry`, `--self-test-stream-chat-panel`, `--self-test-embeds`. Results land under `%LocalAppData%\DestinyChatDesktop\`.
+
 ## Usage
 
 1. Run `Run Destiny Chat.cmd` (or run `dist\DestinyChatDesktop.exe` after build)

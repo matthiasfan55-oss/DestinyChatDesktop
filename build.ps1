@@ -67,7 +67,10 @@ if ($CreatePortablePackage) {
     }
 
     New-Item -ItemType Directory -Force -Path $portableStageDir | Out-Null
-    Copy-Item (Join-Path $distDir '*') $portableStageDir -Force
+    $excludeFromPackage = @('state.json', 'cookies.json', 'split-self-test.json')
+    Get-ChildItem -LiteralPath $distDir | Where-Object { $excludeFromPackage -notcontains $_.Name } | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $portableStageDir -Recurse -Force
+    }
     Compress-Archive -Path (Join-Path $portableStageDir '*') -DestinationPath $portablePackagePath -Force
 
     $hash = (Get-FileHash -Algorithm SHA256 $portablePackagePath).Hash.ToLowerInvariant()

@@ -579,9 +579,15 @@ namespace DestinyChatDesktop.Embedded
         private string _lastSnipRequestId;
         private DateTime _lastSnipRequestUtc;
         private bool _treatSnipAsProbe;
+        /// <summary>When true, the form is rendered inside WPF (<see cref="System.Windows.Forms.Integration.WindowsFormsHost"/>).</summary>
+        private readonly bool _hostedInWpfShell;
+        /// <summary>Native pixel bounds used to restore the outer WPF hwnd after fullscreen.</summary>
+        private NativeRECT _hostedShellRestoreRect;
+        private bool _hostedShellRestoreCaptured;
 
         public MainForm(string storageRoot, string statePath, AppConfig config, AppState state, bool runSplitSelfTest, bool runToolbarSelfTest, bool runDualSelfTest, bool runBigscreenGeometrySelfTest, bool runStreamChatPanelSelfTest, bool runEmbedSelfTest, string selfTestResultPath, bool hostedInWpfShell = false)
         {
+            _hostedInWpfShell = hostedInWpfShell;
             _storageRoot = storageRoot;
             _statePath = statePath;
             _cookiePath = Path.Combine(_storageRoot, "cookies.json");
@@ -623,7 +629,10 @@ namespace DestinyChatDesktop.Embedded
                 ApplyInitialWindowBounds();
             }
 
-            TopMost = startPinned;
+            if (!_hostedInWpfShell)
+            {
+                TopMost = startPinned;
+            }
 
             _toolStrip = new ChromeToolStrip();
             _toolStrip.GripStyle = ToolStripGripStyle.Hidden;
@@ -861,6 +870,11 @@ namespace DestinyChatDesktop.Embedded
 
         public static double ClampZoom(double zoomFactor)
         {
+            if (zoomFactor <= 0.0)
+            {
+                return 1.0;
+            }
+
             if (zoomFactor < 0.50)
             {
                 return 0.50;
@@ -869,11 +883,6 @@ namespace DestinyChatDesktop.Embedded
             if (zoomFactor > 2.50)
             {
                 return 2.50;
-            }
-
-            if (zoomFactor <= 0.0)
-            {
-                return 1.0;
             }
 
             return Math.Round(zoomFactor, 2);
@@ -932,8 +941,47 @@ namespace DestinyChatDesktop.Embedded
         [DllImport("user32.dll")]
         private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativeRECT
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetAncestor(IntPtr hwnd, uint gaFlags);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsZoomed(IntPtr hwnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetWindowRect(IntPtr hWnd, out NativeRECT lpRect);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint uFlags);
+
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
         [DllImport("dwmapi.dll")]
         private static extern int DwmSetWindowAttribute(IntPtr hwnd, int dwAttribute, ref int pvAttribute, int cbAttribute);
+
+        private const uint GaRoot = 2;
+        private const int WmSyscommand = 0x0112;
+        private const int ScMinimize = 0xF020;
+        private const int ScMaximize = 0xF030;
+        private const int ScRestore = 0xF120;
+        private const int SwMinimize = 6;
+        private const int SwRestore = 9;
+        private const int SwShowmaximized = 3;
+        private const uint SwpNomove = 0x0002;
+        private const uint SwpNosize = 0x0001;
+        private const uint SwpNozorder = 0x0004;
+        private const uint SwpShowwindow = 0x0040;
+        private static readonly IntPtr HwndTopmost = new IntPtr(-1);
+        private static readonly IntPtr HwndNotopmost = new IntPtr(-2);
 
         private const int WmNcHitTest = 0x0084;
         private const int WmNcActivate = 0x0086;
@@ -973,6 +1021,10 @@ namespace DestinyChatDesktop.Embedded
         {
             base.OnHandleCreated(e);
             ApplyDwmChromeColors();
+            if (_hostedInWpfShell && _pinButton != null && !_pinButton.IsDisposed)
+            {
+                ApplyHostedAlwaysOnTop(_pinButton.Checked);
+            }
         }
 
         protected override void OnActivated(EventArgs e)
@@ -996,19 +1048,64 @@ namespace DestinyChatDesktop.Embedded
                 return;
             }
 
+            IntPtr target = _hostedInWpfShell ? GetHostedShellHwnd() : Handle;
+            if (target == IntPtr.Zero)
+            {
+                return;
+            }
+
             try
             {
                 int enabled = 1;
-                DwmSetWindowAttribute(Handle, DwmwaUseImmersiveDarkMode, ref enabled, Marshal.SizeOf(typeof(int)));
+                DwmSetWindowAttribute(target, DwmwaUseImmersiveDarkMode, ref enabled, Marshal.SizeOf(typeof(int)));
 
                 int black = 0x000000;
-                DwmSetWindowAttribute(Handle, DwmwaBorderColor, ref black, Marshal.SizeOf(typeof(int)));
-                DwmSetWindowAttribute(Handle, DwmwaCaptionColor, ref black, Marshal.SizeOf(typeof(int)));
+                DwmSetWindowAttribute(target, DwmwaBorderColor, ref black, Marshal.SizeOf(typeof(int)));
+                DwmSetWindowAttribute(target, DwmwaCaptionColor, ref black, Marshal.SizeOf(typeof(int)));
             }
             catch
             {
                 // Older Windows builds may not support these DWM attributes.
             }
+        }
+
+        private IntPtr GetHostedShellHwnd()
+        {
+            if (!IsHandleCreated)
+            {
+                return IntPtr.Zero;
+            }
+
+            if (!_hostedInWpfShell)
+            {
+                return Handle;
+            }
+
+            IntPtr root = GetAncestor(Handle, GaRoot);
+            return root != IntPtr.Zero ? root : Handle;
+        }
+
+        private void ApplyHostedAlwaysOnTop(bool pinned)
+        {
+            if (!_hostedInWpfShell || !IsHandleCreated)
+            {
+                return;
+            }
+
+            IntPtr shell = GetHostedShellHwnd();
+            if (shell == IntPtr.Zero)
+            {
+                return;
+            }
+
+            SetWindowPos(
+                shell,
+                pinned ? HwndTopmost : HwndNotopmost,
+                0,
+                0,
+                0,
+                0,
+                SwpNomove | SwpNosize | SwpShowwindow);
         }
 
         private void InvalidateCaptionChrome()
@@ -1044,6 +1141,12 @@ namespace DestinyChatDesktop.Embedded
             {
                 base.WndProc(ref m);
                 ApplyDwmChromeColors();
+                return;
+            }
+
+            if (m.Msg == WmNcHitTest && _hostedInWpfShell)
+            {
+                base.WndProc(ref m);
                 return;
             }
 
@@ -1314,6 +1417,11 @@ namespace DestinyChatDesktop.Embedded
 
         private async void OnShown(object sender, EventArgs e)
         {
+            if (_hostedInWpfShell)
+            {
+                UpdateCaptionMaxButtonGlyph();
+            }
+
             await InitializeBrowserAsync();
         }
 
@@ -1553,7 +1661,9 @@ namespace DestinyChatDesktop.Embedded
 
         private async void BeginStartupUpdateCheck()
         {
-            if (_startupUpdateCheckQueued || !_config.CheckForUpdatesOnStartup || _runSplitSelfTest || _runEmbedSelfTest)
+            if (_startupUpdateCheckQueued || !_config.CheckForUpdatesOnStartup ||
+                _runSplitSelfTest || _runDualSelfTest || _runBigscreenGeometrySelfTest ||
+                _runStreamChatPanelSelfTest || _runEmbedSelfTest || _runToolbarSelfTest)
             {
                 return;
             }
@@ -10757,32 +10867,28 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             object mediaRaw;
             if (root.TryGetValue("media_extended", out mediaRaw))
             {
-                object[] mediaItems = mediaRaw as object[];
-                if (mediaItems != null)
+                foreach (object itemObj in EnumerateJsonArray(mediaRaw))
                 {
-                    foreach (object itemObj in mediaItems)
+                    Dictionary<string, object> item = itemObj as Dictionary<string, object>;
+                    if (item == null)
                     {
-                        Dictionary<string, object> item = itemObj as Dictionary<string, object>;
-                        if (item == null)
-                        {
-                            continue;
-                        }
-
-                        string mediaType = GetString(item, "type");
-                        string mediaUrl = GetString(item, "url");
-                        string thumbUrl = GetString(item, "thumbnail_url");
-                        if (string.IsNullOrWhiteSpace(mediaUrl))
-                        {
-                            continue;
-                        }
-
-                        mediaOut.Add(new Dictionary<string, object>
-                        {
-                            { "type", string.Equals(mediaType, "video", StringComparison.OrdinalIgnoreCase) || string.Equals(mediaType, "gif", StringComparison.OrdinalIgnoreCase) ? "video" : "image" },
-                            { "url", mediaUrl },
-                            { "thumbnailUrl", thumbUrl }
-                        });
+                        continue;
                     }
+
+                    string mediaType = GetString(item, "type");
+                    string mediaUrl = GetString(item, "url");
+                    string thumbUrl = GetString(item, "thumbnail_url");
+                    if (string.IsNullOrWhiteSpace(mediaUrl))
+                    {
+                        continue;
+                    }
+
+                    mediaOut.Add(new Dictionary<string, object>
+                    {
+                        { "type", string.Equals(mediaType, "video", StringComparison.OrdinalIgnoreCase) || string.Equals(mediaType, "gif", StringComparison.OrdinalIgnoreCase) ? "video" : "image" },
+                        { "url", mediaUrl },
+                        { "thumbnailUrl", thumbUrl }
+                    });
                 }
             }
 
@@ -10837,13 +10943,13 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             });
 
             // Reddit returns [postListing, commentListing]
-            object[] root = ScriptJson.Serializer.DeserializeObject(json) as object[];
-            if (root == null || root.Length < 1) { result["error"] = "invalid-reddit-response"; return result; }
+            System.Collections.ArrayList root = ScriptJson.Serializer.DeserializeObject(json) as System.Collections.ArrayList;
+            if (root == null || root.Count < 1) { result["error"] = "invalid-reddit-response"; return result; }
 
             Dictionary<string, object> firstListing = root[0] as Dictionary<string, object>;
             Dictionary<string, object> listingData = firstListing != null && firstListing.ContainsKey("data") ? firstListing["data"] as Dictionary<string, object> : null;
-            object[] children = listingData != null && listingData.ContainsKey("children") ? listingData["children"] as object[] : null;
-            Dictionary<string, object> firstChild = children != null && children.Length > 0 ? children[0] as Dictionary<string, object> : null;
+            System.Collections.ArrayList children = listingData != null && listingData.ContainsKey("children") ? listingData["children"] as System.Collections.ArrayList : null;
+            Dictionary<string, object> firstChild = children != null && children.Count > 0 ? children[0] as Dictionary<string, object> : null;
             Dictionary<string, object> post = firstChild != null && firstChild.ContainsKey("data") ? firstChild["data"] as Dictionary<string, object> : null;
 
             if (post == null) { result["error"] = "no-post-data"; return result; }
@@ -10886,8 +10992,8 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             Dictionary<string, object> preview = post.ContainsKey("preview") ? post["preview"] as Dictionary<string, object> : null;
             if (preview != null && preview.ContainsKey("images"))
             {
-                object[] images = preview["images"] as object[];
-                if (images != null && images.Length > 0)
+                System.Collections.ArrayList images = preview["images"] as System.Collections.ArrayList;
+                if (images != null && images.Count > 0)
                 {
                     Dictionary<string, object> firstImage = images[0] as Dictionary<string, object>;
                     Dictionary<string, object> source = firstImage != null && firstImage.ContainsKey("source") ? firstImage["source"] as Dictionary<string, object> : null;
@@ -12800,11 +12906,38 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
         private void OnCaptionMinimizeClicked(object sender, EventArgs e)
         {
+            if (_hostedInWpfShell)
+            {
+                IntPtr shell = GetHostedShellHwnd();
+                if (shell != IntPtr.Zero)
+                {
+                    ShowWindow(shell, SwMinimize);
+                }
+
+                return;
+            }
+
             WindowState = FormWindowState.Minimized;
         }
 
         private void OnCaptionMaxRestoreClicked(object sender, EventArgs e)
         {
+            if (_hostedInWpfShell)
+            {
+                IntPtr shell = GetHostedShellHwnd();
+                if (shell != IntPtr.Zero && IsZoomed(shell))
+                {
+                    SendMessage(shell, WmSyscommand, (IntPtr)ScRestore, IntPtr.Zero);
+                }
+                else if (shell != IntPtr.Zero)
+                {
+                    SendMessage(shell, WmSyscommand, (IntPtr)ScMaximize, IntPtr.Zero);
+                }
+
+                UpdateCaptionMaxButtonGlyph();
+                return;
+            }
+
             if (WindowState == FormWindowState.Maximized)
             {
                 WindowState = FormWindowState.Normal;
@@ -12839,7 +12972,8 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             }
 
             ReleaseCapture();
-            SendMessage(Handle, WmNclButtonDown, (IntPtr)HtCaption, IntPtr.Zero);
+            IntPtr hwnd = _hostedInWpfShell ? GetHostedShellHwnd() : Handle;
+            SendMessage(hwnd, WmNclButtonDown, (IntPtr)HtCaption, IntPtr.Zero);
         }
 
         private void OnCaptionDragPanelDoubleClick(object sender, EventArgs e)
@@ -12854,7 +12988,9 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 return;
             }
 
-            bool maxed = WindowState == FormWindowState.Maximized;
+            bool maxed = _hostedInWpfShell && IsHandleCreated
+                ? IsZoomed(GetHostedShellHwnd())
+                : WindowState == FormWindowState.Maximized;
             if (_captionUseMarlettGlyphs)
             {
                 _captionMaximizeButton.Text = maxed ? "2" : "1";
@@ -13058,7 +13194,15 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
         private void OnPinClicked(object sender, EventArgs e)
         {
-            TopMost = _pinButton.Checked;
+            if (_hostedInWpfShell)
+            {
+                ApplyHostedAlwaysOnTop(_pinButton.Checked);
+            }
+            else
+            {
+                TopMost = _pinButton.Checked;
+            }
+
             SetStatus(_pinButton.Checked ? "Window pinned on top." : "Window pin disabled.");
         }
 
@@ -14469,6 +14613,12 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
         private void ToggleFullScreen()
         {
+            if (_hostedInWpfShell)
+            {
+                ToggleFullScreenHostedShell();
+                return;
+            }
+
             if (_isFullScreen)
             {
                 FormBorderStyle = _savedBorderStyle;
@@ -14497,6 +14647,72 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
             SetStatus("Fullscreen enabled.");
         }
 
+        /// <summary>Fullscreen/maximize gestures must target the top-level hwnd when hosted inside WPF.</summary>
+        private void ToggleFullScreenHostedShell()
+        {
+            if (!IsHandleCreated)
+            {
+                return;
+            }
+
+            IntPtr shell = GetHostedShellHwnd();
+            if (shell == IntPtr.Zero)
+            {
+                return;
+            }
+
+            if (_isFullScreen)
+            {
+                FormBorderStyle = _savedBorderStyle;
+                _captionChromePanel.Visible = true;
+
+                ShowWindow(shell, SwRestore);
+
+                if (_hostedShellRestoreCaptured &&
+                    !SetWindowPos(
+                        shell,
+                        IntPtr.Zero,
+                        _hostedShellRestoreRect.Left,
+                        _hostedShellRestoreRect.Top,
+                        _hostedShellRestoreRect.Right - _hostedShellRestoreRect.Left,
+                        _hostedShellRestoreRect.Bottom - _hostedShellRestoreRect.Top,
+                        SwpNozorder | SwpShowwindow))
+                {
+                    // Best effort fallback if explicit placement fails.
+                    ShowWindow(shell, SwRestore);
+                }
+
+                _hostedShellRestoreCaptured = false;
+                _isFullScreen = false;
+                LayoutDualChatPanel();
+                UpdateCaptionMaxButtonGlyph();
+                SetStatus("Exited fullscreen.");
+                return;
+            }
+
+            _savedBorderStyle = FormBorderStyle;
+
+            if (GetWindowRect(shell, out NativeRECT rr))
+            {
+                _hostedShellRestoreRect = rr;
+                _hostedShellRestoreCaptured = true;
+            }
+            else
+            {
+                _hostedShellRestoreCaptured = false;
+            }
+
+            _captionChromePanel.Visible = false;
+            FormBorderStyle = FormBorderStyle.None;
+
+            ShowWindow(shell, SwShowmaximized);
+
+            _isFullScreen = true;
+            LayoutDualChatPanel();
+            UpdateCaptionMaxButtonGlyph();
+            SetStatus("Fullscreen enabled.");
+        }
+
         private void OnFormClosing(object sender, FormClosingEventArgs e)
         {
             try
@@ -14504,12 +14720,40 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 _sessionPersistTimer.Stop();
                 _sessionPersistTimer.Dispose();
 
-                Rectangle bounds = WindowState == FormWindowState.Normal ? DesktopBounds : RestoreBounds;
+                Rectangle bounds;
+                bool isMaximized;
+
+                if (_hostedInWpfShell && IsHandleCreated)
+                {
+                    IntPtr shell = GetHostedShellHwnd();
+                    isMaximized = shell != IntPtr.Zero && IsZoomed(shell);
+                    if (shell != IntPtr.Zero &&
+                        GetWindowRect(shell, out NativeRECT wr))
+                    {
+                        bounds = Rectangle.FromLTRB(wr.Left, wr.Top, wr.Right, wr.Bottom);
+                    }
+                    else
+                    {
+                        bounds = Rectangle.Empty;
+                    }
+
+                    if (bounds.Width <= 0 || bounds.Height <= 0)
+                    {
+                        bounds = WindowState == FormWindowState.Normal ? DesktopBounds : RestoreBounds;
+                        isMaximized = WindowState == FormWindowState.Maximized;
+                    }
+                }
+                else
+                {
+                    bounds = WindowState == FormWindowState.Normal ? DesktopBounds : RestoreBounds;
+                    isMaximized = WindowState == FormWindowState.Maximized;
+                }
+
                 _state.X = bounds.X;
                 _state.Y = bounds.Y;
                 _state.Width = bounds.Width;
                 _state.Height = bounds.Height;
-                _state.IsMaximized = WindowState == FormWindowState.Maximized;
+                _state.IsMaximized = isMaximized;
                 _state.AlwaysOnTop = _pinButton.Checked;
                 _state.Muted = _muteButton.Checked;
                 _state.LastUrl = _browserReady && _webView.Source != null ? _webView.Source.AbsoluteUri : _pendingNavigation;
