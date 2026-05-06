@@ -1876,7 +1876,12 @@ namespace DestinyChatDesktop.Embedded
             startInfo.UseShellExecute = false;
             startInfo.CreateNoWindow = true;
 
-            Process.Start(startInfo);
+            Process started = Process.Start(startInfo);
+            if (started != null)
+            {
+                started.Dispose();
+            }
+
             BeginInvoke(new Action(Close));
         }
 
@@ -2074,7 +2079,23 @@ namespace DestinyChatDesktop.Embedded
     [string]$ExeName
 )
 
-$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Continue'
+$logPath = Join-Path $PSScriptRoot 'apply-update.log'
+
+function Write-Log {
+    param([string]$Message)
+    try {
+        $stamp = (Get-Date).ToString('s')
+        Add-Content -LiteralPath $logPath -Value (""[{0}] {1}"" -f $stamp, $Message)
+    } catch {}
+}
+
+Write-Log ""Starting update. WaitPid=$WaitPid InstallRoot=$InstallRoot PackageRoot=$PackageRoot ExeName=$ExeName""
+
+if (-not (Test-Path -LiteralPath $PackageRoot)) {
+    Write-Log ""PackageRoot not found, aborting.""
+    exit 1
+}
 
 for ($i = 0; $i -lt 240; $i++) {
     $process = Get-Process -Id $WaitPid -ErrorAction SilentlyContinue
@@ -2085,22 +2106,42 @@ for ($i = 0; $i -lt 240; $i++) {
     Start-Sleep -Milliseconds 500
 }
 
+# Files we never overwrite — preserves user customisations across updates.
+$preserveFiles = @('appsettings.json')
+
 Get-ChildItem -LiteralPath $PackageRoot -Force | ForEach-Object {
     $destination = Join-Path $InstallRoot $_.Name
-    if ($_.PSIsContainer) {
-        if (Test-Path -LiteralPath $destination) {
-            Remove-Item -LiteralPath $destination -Recurse -Force
-        }
 
-        Copy-Item -LiteralPath $_.FullName -Destination $destination -Recurse -Force
+    if (-not $_.PSIsContainer -and ($preserveFiles -contains $_.Name) -and (Test-Path -LiteralPath $destination)) {
+        Write-Log ""Preserving existing $($_.Name).""
         return
     }
 
-    Copy-Item -LiteralPath $_.FullName -Destination $destination -Force
+    try {
+        if ($_.PSIsContainer) {
+            if (Test-Path -LiteralPath $destination) {
+                Remove-Item -LiteralPath $destination -Recurse -Force -ErrorAction Stop
+            }
+
+            Copy-Item -LiteralPath $_.FullName -Destination $destination -Recurse -Force -ErrorAction Stop
+        } else {
+            Copy-Item -LiteralPath $_.FullName -Destination $destination -Force -ErrorAction Stop
+        }
+
+        Write-Log ""Copied $($_.Name).""
+    } catch {
+        Write-Log ""Failed to copy $($_.Name): $($_.Exception.Message)""
+    }
 }
 
 Start-Sleep -Seconds 1
-Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
+
+try {
+    Start-Process -FilePath (Join-Path $InstallRoot $ExeName) -ErrorAction Stop
+    Write-Log ""Restarted app.""
+} catch {
+    Write-Log ""Failed to restart app: $($_.Exception.Message)""
+}
 ";
         }
 
