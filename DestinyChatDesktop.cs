@@ -540,6 +540,11 @@ namespace DestinyChatDesktop
 
         public static double ClampZoom(double zoomFactor)
         {
+            if (double.IsNaN(zoomFactor) || double.IsInfinity(zoomFactor) || zoomFactor <= 0.0)
+            {
+                return 1.0;
+            }
+
             if (zoomFactor < 0.50)
             {
                 return 0.50;
@@ -548,11 +553,6 @@ namespace DestinyChatDesktop
             if (zoomFactor > 2.50)
             {
                 return 2.50;
-            }
-
-            if (zoomFactor <= 0.0)
-            {
-                return 1.0;
             }
 
             return Math.Round(zoomFactor, 2);
@@ -4583,8 +4583,9 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                     pngBytes = ms.ToArray();
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                System.Diagnostics.Debug.WriteLine("[Snip] PNG encode failed: " + ex);
                 PostSnipResult(null, "encode");
                 return;
             }
@@ -4625,7 +4626,10 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                         uploadedUrl = Convert.ToString(dict["link"]);
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("[Snip] Upload failed: " + ex);
+            }
 
             if (string.IsNullOrEmpty(uploadedUrl))
             {
@@ -4866,9 +4870,9 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 NavigateToUrl(url);
                 SetStatus("Opened bigscreen selection. Click Chat to return to chat-only view.");
             }
-            catch
+            catch (Exception ex)
             {
-                // Ignore malformed page messages.
+                System.Diagnostics.Debug.WriteLine("[BigscreenEmbedsUi] Malformed message ignored: " + ex);
             }
         }
 
@@ -4908,6 +4912,17 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                             continue;
                         }
 
+                        // Defense in depth: drop any embed URL that isn't http/https before
+                        // we render it back into the embed bar or treat it as a clickable target.
+                        Uri parsedEmbedUri;
+                        if (!Uri.TryCreate(url, UriKind.Absolute, out parsedEmbedUri) ||
+                            (!parsedEmbedUri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) &&
+                             !parsedEmbedUri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            System.Diagnostics.Debug.WriteLine("[BigscreenBar] Dropping embed with unsupported URL: " + url);
+                            continue;
+                        }
+
                         bool isSelected = false;
                         if (values.ContainsKey("selected"))
                         {
@@ -4938,9 +4953,9 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
                 UpdateBigscreenEmbeds(embeds);
                 NotifyDualChatSourceChanged();
             }
-            catch
+            catch (Exception ex)
             {
-                // Ignore malformed page messages.
+                System.Diagnostics.Debug.WriteLine("[BigscreenBar] Malformed message ignored: " + ex);
             }
         }
 
@@ -6071,16 +6086,39 @@ Start-Process -FilePath (Join-Path $InstallRoot $ExeName)
 
         private void OpenInDefaultBrowser(string url)
         {
+            // Only open http/https URLs in the user's shell. Process.Start with UseShellExecute=true
+            // would otherwise happily launch javascript:, file:, vbscript:, custom protocol handlers,
+            // or local executables for any URL that fell out of the in-app allow-list.
+            Uri uri;
+            if (!Uri.TryCreate(url, UriKind.Absolute, out uri))
+            {
+                SetStatus("Could not open the browser: invalid URL.");
+                return;
+            }
+
+            if (!uri.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) &&
+                !uri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+            {
+                System.Diagnostics.Debug.WriteLine("[OpenInDefaultBrowser] Refusing non-http(s) scheme: " + uri.Scheme);
+                SetStatus("Did not open link with unsupported scheme: " + uri.Scheme);
+                return;
+            }
+
             try
             {
-                Process.Start(new ProcessStartInfo
+                Process started = Process.Start(new ProcessStartInfo
                 {
-                    FileName = url,
+                    FileName = uri.AbsoluteUri,
                     UseShellExecute = true
                 });
+                if (started != null)
+                {
+                    started.Dispose();
+                }
             }
             catch (Exception ex)
             {
+                System.Diagnostics.Debug.WriteLine("[OpenInDefaultBrowser] Process.Start failed: " + ex);
                 SetStatus("Could not open the browser: " + ex.Message);
             }
         }
