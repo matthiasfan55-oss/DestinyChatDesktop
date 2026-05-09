@@ -29,5 +29,5 @@ Windows desktop wrapper for the live Destiny.gg embedded chat at `https://www.de
 
 - The actual chat, login flow, and site functionality still come from the live Destiny.gg website.
 - This project uses the archived `destinygg/website` repo for historical reference and the `destinygg/chat-gui` repo for current chat embed behavior.
-- GitHub releases should be tagged as `v<appVersion>`, for example `v0.1.0`.
+- GitHub releases should be tagged as `v<appVersion>`, for example `v0.1.1`.
 - The updater looks for the `DestinyChatDesktop-portable.zip` asset on the latest GitHub release for the configured repo.
