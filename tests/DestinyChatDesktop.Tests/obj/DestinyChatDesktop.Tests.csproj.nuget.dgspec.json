@@ -1,0 +1,155 @@
+{
+  "format": 1,
+  "restore": {
+    "C:\\Destiny\\DestinyChatDesktop\\tests\\DestinyChatDesktop.Tests\\DestinyChatDesktop.Tests.csproj": {}
+  },
+  "projects": {
+    "C:\\Destiny\\DestinyChatDesktop\\src\\DestinyChatDesktop.EmbeddedWinForms\\DestinyChatDesktop.EmbeddedWinForms.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "C:\\Destiny\\DestinyChatDesktop\\src\\DestinyChatDesktop.EmbeddedWinForms\\DestinyChatDesktop.EmbeddedWinForms.csproj",
+        "projectName": "DestinyChatDesktop.EmbeddedWinForms",
+        "projectPath": "C:\\Destiny\\DestinyChatDesktop\\src\\DestinyChatDesktop.EmbeddedWinForms\\DestinyChatDesktop.EmbeddedWinForms.csproj",
+        "packagesPath": "C:\\Users\\seths\\.nuget\\packages\\",
+        "outputPath": "C:\\Destiny\\DestinyChatDesktop\\src\\DestinyChatDesktop.EmbeddedWinForms\\obj\\",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "C:\\Users\\seths\\AppData\\Roaming\\NuGet\\NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net8.0-windows"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net8.0-windows7.0": {
+            "targetAlias": "net8.0-windows",
+            "projectReferences": {}
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        }
+      },
+      "frameworks": {
+        "net8.0-windows7.0": {
+          "targetAlias": "net8.0-windows",
+          "dependencies": {
+            "Microsoft.Web.WebView2": {
+              "target": "Package",
+              "version": "[1.0.2957.106, )"
+            },
+            "Newtonsoft.Json": {
+              "target": "Package",
+              "version": "[13.0.3, )"
+            }
+          },
+          "imports": [
+            "net461",
+            "net462",
+            "net47",
+            "net471",
+            "net472",
+            "net48",
+            "net481"
+          ],
+          "assetTargetFallback": true,
+          "warn": true,
+          "frameworkReferences": {
+            "Microsoft.NETCore.App": {
+              "privateAssets": "all"
+            },
+            "Microsoft.WindowsDesktop.App.WindowsForms": {
+              "privateAssets": "none"
+            }
+          },
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\8.0.420/PortableRuntimeIdentifierGraph.json"
+        }
+      }
+    },
+    "C:\\Destiny\\DestinyChatDesktop\\tests\\DestinyChatDesktop.Tests\\DestinyChatDesktop.Tests.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "C:\\Destiny\\DestinyChatDesktop\\tests\\DestinyChatDesktop.Tests\\DestinyChatDesktop.Tests.csproj",
+        "projectName": "DestinyChatDesktop.Tests",
+        "projectPath": "C:\\Destiny\\DestinyChatDesktop\\tests\\DestinyChatDesktop.Tests\\DestinyChatDesktop.Tests.csproj",
+        "packagesPath": "C:\\Users\\seths\\.nuget\\packages\\",
+        "outputPath": "C:\\Destiny\\DestinyChatDesktop\\tests\\DestinyChatDesktop.Tests\\obj\\",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "C:\\Users\\seths\\AppData\\Roaming\\NuGet\\NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net8.0-windows"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net8.0-windows7.0": {
+            "targetAlias": "net8.0-windows",
+            "projectReferences": {
+              "C:\\Destiny\\DestinyChatDesktop\\src\\DestinyChatDesktop.EmbeddedWinForms\\DestinyChatDesktop.EmbeddedWinForms.csproj": {
+                "projectPath": "C:\\Destiny\\DestinyChatDesktop\\src\\DestinyChatDesktop.EmbeddedWinForms\\DestinyChatDesktop.EmbeddedWinForms.csproj"
+              }
+            }
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        }
+      },
+      "frameworks": {
+        "net8.0-windows7.0": {
+          "targetAlias": "net8.0-windows",
+          "dependencies": {
+            "MSTest.TestAdapter": {
+              "target": "Package",
+              "version": "[3.6.2, )"
+            },
+            "MSTest.TestFramework": {
+              "target": "Package",
+              "version": "[3.6.2, )"
+            },
+            "Microsoft.NET.Test.Sdk": {
+              "target": "Package",
+              "version": "[17.11.1, )"
+            }
+          },
+          "imports": [
+            "net461",
+            "net462",
+            "net47",
+            "net471",
+            "net472",
+            "net48",
+            "net481"
+          ],
+          "assetTargetFallback": true,
+          "warn": true,
+          "frameworkReferences": {
+            "Microsoft.NETCore.App": {
+              "privateAssets": "all"
+            }
+          },
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\8.0.420/PortableRuntimeIdentifierGraph.json"
+        }
+      }
+    }
+  }
+}

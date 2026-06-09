@@ -1,0 +1,25 @@
+{
+  "version": 2,
+  "dgSpecHash": "UhxHK3Juezc=",
+  "success": true,
+  "projectFilePath": "C:\\Destiny\\DestinyChatDesktop\\tests\\DestinyChatDesktop.Tests\\DestinyChatDesktop.Tests.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\seths\\.nuget\\packages\\microsoft.applicationinsights\\2.22.0\\microsoft.applicationinsights.2.22.0.nupkg.sha512",
+    "C:\\Users\\seths\\.nuget\\packages\\microsoft.codecoverage\\17.11.1\\microsoft.codecoverage.17.11.1.nupkg.sha512",
+    "C:\\Users\\seths\\.nuget\\packages\\microsoft.net.test.sdk\\17.11.1\\microsoft.net.test.sdk.17.11.1.nupkg.sha512",
+    "C:\\Users\\seths\\.nuget\\packages\\microsoft.testing.extensions.telemetry\\1.4.2\\microsoft.testing.extensions.telemetry.1.4.2.nupkg.sha512",
+    "C:\\Users\\seths\\.nuget\\packages\\microsoft.testing.extensions.trxreport.abstractions\\1.4.2\\microsoft.testing.extensions.trxreport.abstractions.1.4.2.nupkg.sha512",
+    "C:\\Users\\seths\\.nuget\\packages\\microsoft.testing.extensions.vstestbridge\\1.4.2\\microsoft.testing.extensions.vstestbridge.1.4.2.nupkg.sha512",
+    "C:\\Users\\seths\\.nuget\\packages\\microsoft.testing.platform\\1.4.2\\microsoft.testing.platform.1.4.2.nupkg.sha512",
+    "C:\\Users\\seths\\.nuget\\packages\\microsoft.testing.platform.msbuild\\1.4.2\\microsoft.testing.platform.msbuild.1.4.2.nupkg.sha512",
+    "C:\\Users\\seths\\.nuget\\packages\\microsoft.testplatform.objectmodel\\17.11.1\\microsoft.testplatform.objectmodel.17.11.1.nupkg.sha512",
+    "C:\\Users\\seths\\.nuget\\packages\\microsoft.testplatform.testhost\\17.11.1\\microsoft.testplatform.testhost.17.11.1.nupkg.sha512",
+    "C:\\Users\\seths\\.nuget\\packages\\microsoft.web.webview2\\1.0.2957.106\\microsoft.web.webview2.1.0.2957.106.nupkg.sha512",
+    "C:\\Users\\seths\\.nuget\\packages\\mstest.testadapter\\3.6.2\\mstest.testadapter.3.6.2.nupkg.sha512",
+    "C:\\Users\\seths\\.nuget\\packages\\mstest.testframework\\3.6.2\\mstest.testframework.3.6.2.nupkg.sha512",
+    "C:\\Users\\seths\\.nuget\\packages\\newtonsoft.json\\13.0.3\\newtonsoft.json.13.0.3.nupkg.sha512",
+    "C:\\Users\\seths\\.nuget\\packages\\system.diagnostics.diagnosticsource\\5.0.0\\system.diagnostics.diagnosticsource.5.0.0.nupkg.sha512",
+    "C:\\Users\\seths\\.nuget\\packages\\system.reflection.metadata\\1.6.0\\system.reflection.metadata.1.6.0.nupkg.sha512"
+  ],
+  "logs": []
+}
